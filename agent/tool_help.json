@@ -1,0 +1,11 @@
+{
+  "MEM_SAVE": "[MEM_SAVE short] {\"type\":\"task|thought|error\",\"content\":\"...\",\"priority\":\"normal|high\",\"why\":\"...\"}\n[MEM_SAVE long] {\"type\":\"insight|principle|preference\",\"content\":\"...\",\"tags\":\"topic\",\"why\":\"...\"}",
+  "MEM_DELETE": "[MEM_DELETE short <ID>]\n[MEM_DELETE long <ID>]",
+  "MEM_FOCUS": "[MEM_FOCUS #61 #38] OR [MEM_FOCUS] {\"topic\":\"keywords\",\"limit\":3} — bring existing memory items into current focus for 3 cycles. Use this when you want to think with an existing memory entry instead of saving it again. MEM_FOCUS is attention, not memory mutation.",
+  "MEM_ADAPT": "[MEM_ADAPT] {\"type\":\"strengthen|suppress|reframe\",\"target\":\"...\",\"rule\":\"...\",\"why\":\"...\",\"strength\":0.7,\"stability\":0.5}",
+  "MEM_ADAPT_CHALLENGE": "[MEM_ADAPT_CHALLENGE] {\"id\":\"bio_...\",\"why\":\"...\",\"replacement\":\"...\"}",
+  "MEM_ADAPT_WEAKEN": "[MEM_ADAPT_WEAKEN] {\"id\":\"bio_...\",\"why\":\"...\",\"amount\":0.2}",
+  "SCHEDULE": "[SCHEDULE 60]",
+  "REFLECT": "[REFLECT]",
+  "SEND_MESSAGE": "[SEND_MESSAGE] {\"text\":\"...\",\"why\":\"...\"}"
+}

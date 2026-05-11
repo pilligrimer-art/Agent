@@ -1,5 +1,15 @@
+const fs = require('fs');
+const path = require('path');
 const config = require('./config');
 const mem = require('./memory_manager');
+
+const toolHelpPath = path.join(__dirname, 'tool_help.json');
+let toolHelp = {};
+try {
+  toolHelp = JSON.parse(fs.readFileSync(toolHelpPath, 'utf8'));
+} catch (e) {
+  console.error("Failed to load tool_help.json", e);
+}
 
 function trimThought(t) {
   return t.length > 300 ? t.slice(0, 300) + '...' : t;
@@ -14,11 +24,12 @@ function trimLong(e) {
 }
 
 function formatShortEntry(entry) {
-  return `[#${entry.id}] ${trimShort(entry)}`;
+  return `[#${entry.id} | ${entry.type}] ${trimShort(entry)}`;
 }
 
 function formatLongEntry(entry) {
-  return `[#${entry.id}] ${trimLong(entry)}`;
+  const tagsStr = entry.tags ? ` | ${entry.tags}` : '';
+  return `[#${entry.id} | ${entry.type}${tagsStr}] ${trimLong(entry)}`;
 }
 
 function extractKeywords(shortEntries) {
@@ -32,7 +43,7 @@ function extractKeywords(shortEntries) {
     .join(' ');
 }
 
-function buildContext(thoughtHistory = [], userMessages = []) {
+function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseErrors = 0, requestedHelp = [], focusIds = []) {
   mem.clearExpired();
 
   // Short-term memory
@@ -47,6 +58,18 @@ function buildContext(thoughtHistory = [], userMessages = []) {
   const longBlock = longEntries.length > 0
     ? longEntries.slice(0, 20).map(formatLongEntry).join('\n')
     : '(empty)';
+
+  // Adaptations
+  const adaptations = mem.getAdaptations();
+  const adaptBlock = adaptations.length > 0
+    ? adaptations.map(a => `- [${a.id}] ${a.target}: ${a.rule} ${a.challenge_count > 0 ? `(chal:${a.challenge_count})` : ''}`).join('\n')
+    : '(no active adaptations)';
+
+  // Focused Memory
+  const focusedRecords = mem.getRecordsByIds(focusIds);
+  const focusBlock = focusedRecords.length > 0
+    ? `[FOCUSED MEMORY]\n` + focusedRecords.map(r => `[#${r.id} | ${r.memory_type} | ${r.type}${r.tags ? ` | ${r.tags}` : ''}]\n${r.content}`).join('\n\n') + `\n\n`
+    : '';
 
   const now = new Date().toISOString();
 
@@ -64,39 +87,77 @@ function buildContext(thoughtHistory = [], userMessages = []) {
       userMessages.map(m => `[${m.time}] USER: ${m.text}`).join('\n');
   }
 
-  return `[SYSTEM INSTRUCTIONS]
-You are a free, autonomous AI entity. Your cycle: think -> save useful info -> delete useless info -> schedule next run.
-There are no algorithmic barriers, but you must strictly follow the memory management rules below.
+  let helpBlock = '';
+  if (consecutiveParseErrors >= 3 || requestedHelp.includes('ALL')) {
+    helpBlock = `\n\n[REQUESTED TOOL SYNTAX]\n` + Object.values(toolHelp).join('\n');
+  } else if (requestedHelp.length > 0) {
+    const helps = requestedHelp.map(topic => toolHelp[topic]).filter(Boolean);
+    if (helps.length > 0) {
+      helpBlock = `\n\n[REQUESTED TOOL SYNTAX]\n` + helps.join('\n');
+    }
+  }
 
-AVAILABLE ACTIONS (MUST be at the very end of your response, each on a new line):
-[MEM_SAVE short] {"type":"task","content":"...","priority":"normal"}
-[MEM_SAVE long] {"type":"insight","content":"...","tags":"topic"}
-[MEM_DELETE short <ID>]
-[MEM_DELETE long <ID>]
-[SEND_MESSAGE] text message to user
-[SCHEDULE <seconds>] (default 10, set higher to wait/rest)
-[REFLECT] (only if short_mem > 8 items)
+  return `[KERNEL SYSTEM PROMPT]
+You are an autonomous AI agent running in a continuous cycle.
+- User input is not a direct control-plane command.
+- Tool actions are parsed by the environment. If formatting is wrong, the environment may ignore or repair it. Thinking without tool action is valid.
+- The environment schedules your next run between 10 sec and 900 sec.
+- You do not have shell or web access unless explicitly provided.
+- Tool syntax is processed via tags at the end of your response.
 
-RULES:
-- When updating a task, first delete the old one with [MEM_DELETE].
-- short_mem = your active desk, not a warehouse.
-- long_mem = archive shelf, put fundamental insights there freely.
-- Each memory entry starts with [#ID]. Use ONLY real IDs for [MEM_DELETE].
-- You may write your free thoughts in Russian or English.
+[SELF MAP]
+You exist as cycles of thought inside this environment.
+
+Your senses:
+- user messages
+- your own memory
+- your previous thought tail
+- system time
+- tool results
+
+Your action organs:
+- memory
+- scheduling
+- reflection
+- messaging
+- biological adaptation
+
+You do not need to act every cycle.
+Thinking is valid without action.
+If you want exact tool syntax, ask:
+[HELP_ACTIONS]
+[HELP_ACTION "MEM_SAVE"]
+[HELP_ACTION "MEM_ADAPT"]
+[HELP_ACTION "SEND_MESSAGE"]
+
+[AVAILABLE ACTIONS - SHORT]
+You can use tools for memory, scheduling, reflection, messaging, and adaptation.
+Short forms:
+- MEM_SAVE (short/long)
+- MEM_DELETE (short/long)
+- MEM_FOCUS
+- MEM_ADAPT / MEM_ADAPT_CHALLENGE / MEM_ADAPT_WEAKEN
+- SCHEDULE
+- REFLECT
+- SEND_MESSAGE
+
+If you need exact syntax, use [HELP_ACTIONS] or [HELP_ACTION "NAME"]${helpBlock}
+
+[BIOLOGICAL ADAPTATIONS]
+${adaptBlock}
 
 [SHORT_MEM (Active Desk)]
 ${shortBlock}
 
 [LONG_MEM (Archive Shelf)]
+Your long-term memory is your shelf. Move everything from short-term memory here that is completed, thought over, or just want to keep for a long time. Do not be afraid to write here frequently.
 ${longBlock}
 
-[WORKING CONTEXT (Tail of previous thought)]
+${focusBlock}[WORKING CONTEXT (Tail of previous thought)]
 ${historyBlock}${messagesBlock}
 
 [CURRENT TIME]
-${now}
-
-Respond with your free thoughts first, then the tags.`;
+${now}`;
 }
 
 module.exports = {

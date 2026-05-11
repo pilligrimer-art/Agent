@@ -43,10 +43,12 @@ const memState = {
   thoughtHistory: [],
   pendingMessages: [],
   chatHistory: loadChatHistory(),
-  lastReflectTime: 0
+  lastReflectTime: 0,
+  consecutiveParseErrors: 0,
+  requestedHelp: [],
+  focusItems: []
 };
 
-// --- Функция приема сообщений от пользователя (вызывается из веб-интерфейса) ---
 function pushUserMessage(text) {
   const msg = { sender: 'user', time: new Date().toISOString(), text };
   memState.pendingMessages.push(msg);
@@ -56,6 +58,14 @@ function pushUserMessage(text) {
   // Прерываем ожидание и заставляем агента подумать прямо сейчас
   clearScheduledRun();
   runSafely(runAgent);
+}
+
+function injectSystemMessage(text) {
+  memState.pendingMessages.push({
+    sender: 'system',
+    time: new Date().toISOString(),
+    text
+  });
 }
 
 // --- Запрос к Ollama ---
@@ -192,17 +202,49 @@ function executeActions(parsed) {
   // Удаления
   for (const del of parsed.deletes) {
     try {
-      const deleted = del.kind === 'short'
-        ? mem.deleteShort(del.id)
-        : mem.deleteLong(del.id);
+      let deleted = false;
+      if (del.kind === 'short') {
+        deleted = mem.deleteShort(del.id);
+      } else if (del.kind === 'long') {
+        deleted = mem.deleteLong(del.id);
+      } else {
+        // kind == undefined -> try both
+        deleted = mem.deleteShort(del.id) || mem.deleteLong(del.id);
+      }
+      
       if (deleted) {
         results.deleted++;
       } else {
-        logParseError('EXECUTE_DELETE', `ID ${del.id} не найден в ${del.kind}`);
+        logParseError('EXECUTE_DELETE', `ID ${del.id} не найден${del.kind ? ' в ' + del.kind : ''}`);
       }
     } catch (err) {
       results.errors.push(`DELETE ${del.kind} #${del.id}: ${err.message}`);
       logParseError('EXECUTE_DELETE', err.message);
+    }
+  }
+
+  // Адаптации
+  for (const adapt of (parsed.adapts || [])) {
+    try {
+      mem.addAdaptation(null, adapt.type, adapt.target, adapt.rule, adapt.why, adapt.strength, adapt.stability, 'agent');
+    } catch (err) {
+      logParseError('EXECUTE_ADAPT', err.message);
+    }
+  }
+
+  for (const chal of (parsed.adaptChallenges || [])) {
+    try {
+      mem.challengeAdaptation(chal.id);
+    } catch (err) {
+      logParseError('EXECUTE_CHALLENGE', err.message);
+    }
+  }
+
+  for (const weak of (parsed.adaptWeakens || [])) {
+    try {
+      mem.weakenAdaptation(weak.id, weak.amount || 0.1);
+    } catch (err) {
+      logParseError('EXECUTE_WEAKEN', err.message);
     }
   }
 
@@ -215,7 +257,7 @@ async function runAgent() {
   const messages = [...memState.pendingMessages];
   memState.pendingMessages = [];
 
-  const prompt = buildContext(memState.thoughtHistory, messages);
+  const prompt = buildContext(memState.thoughtHistory, messages, memState.consecutiveParseErrors, memState.requestedHelp, memState.focusItems.map(f => f.id));
   let response = '';
   let parsed = null;
   let error = null;
@@ -229,6 +271,13 @@ async function runAgent() {
     parsed = parseOutput(response);
     const results = executeActions(parsed);
     console.log(`[AGENT] Сохранено: ${results.saved}, удалено: ${results.deleted}`);
+
+    // Учет бюджета ошибок парсинга
+    if (parsed.parseErrorCount > 0) {
+      memState.consecutiveParseErrors += parsed.parseErrorCount;
+    } else {
+      memState.consecutiveParseErrors = 0;
+    }
 
     if (results.errors.length > 0) {
       console.warn(`[AGENT] Ошибки выполнения: ${results.errors.join('; ')}`);
@@ -255,7 +304,44 @@ async function runAgent() {
       }
     }
 
-    nextScheduleSec = parsed.scheduleSec;
+    nextScheduleSec = Math.min(parsed.scheduleSec, 900); // max 15 минут
+    memState.requestedHelp = parsed.helpRequests || [];
+
+    // Обновление фокуса
+    for (let i = memState.focusItems.length - 1; i >= 0; i--) {
+      memState.focusItems[i].ttl -= 1;
+      if (memState.focusItems[i].ttl <= 0) {
+        memState.focusItems.splice(i, 1);
+      }
+    }
+    if (parsed.focusTopics && parsed.focusTopics.length > 0) {
+      if (!parsed.focusIds) parsed.focusIds = [];
+      for (const req of parsed.focusTopics) {
+        const foundShort = mem.searchShortMem(req.topic).slice(0, req.limit || 3);
+        const foundLong = mem.searchLongMem(req.topic, req.limit || 3);
+        const combined = [...foundShort, ...foundLong].slice(0, req.limit || 3);
+        for (const item of combined) {
+          if (!parsed.focusIds.includes(item.id)) {
+            parsed.focusIds.push(item.id);
+          }
+        }
+      }
+    }
+
+    if (parsed.focusIds && parsed.focusIds.length > 0) {
+      for (const id of parsed.focusIds) {
+        const existing = memState.focusItems.find(x => x.id === id);
+        if (existing) {
+          existing.ttl = 3;
+        } else {
+          memState.focusItems.push({ id, ttl: 3 });
+        }
+      }
+    }
+    // Ограничение до 3 элементов
+    if (memState.focusItems.length > 3) {
+      memState.focusItems = memState.focusItems.slice(-3);
+    }
 
     // Вывод мысли агента и добавление в историю
     if (parsed.thought) {
@@ -292,7 +378,12 @@ function main() {
   console.log(`[AGENT] Модель: ${config.modelName}`);
   console.log(`[AGENT] БД: ${path.join(config.memoryDir, 'agent.db')}`);
   console.log(`[AGENT] Записей в STM: ${mem.countShort()}, LTM: ${mem.countLong()}`);
-
+  mem.initBaseAdaptations();
+  memState.pendingMessages.push({
+    sender: 'system',
+    time: new Date().toISOString(),
+    text: '[SYSTEM] Environment started (start.bat was executed).'
+  });
   runSafely(runAgent);
 }
 
@@ -306,5 +397,6 @@ module.exports = {
   runReflection,
   main,
   pushUserMessage,
+  injectSystemMessage,
   getChatHistory: () => memState.chatHistory
 };

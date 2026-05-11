@@ -142,6 +142,17 @@ app.get('/api/logs', (req, res) => {
 });
 
 // Запуск сервера
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`[WEB] Интерфейс: http://localhost:${PORT}`);
+  
+  // Автоматический старт агента
+  console.log('[SYSTEM] Инициализация агента...');
+  mem.initBaseAdaptations();
+  const { injectSystemMessage } = require('./agent/index');
+  if (injectSystemMessage) {
+    injectSystemMessage('[SYSTEM] Environment started (start.bat was executed).');
+  }
+  
+  const { runSafely } = require('./agent/scheduler');
+  await runSafely(runAgent);
 });

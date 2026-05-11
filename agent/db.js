@@ -40,6 +40,23 @@ db.exec(`
   );
 `);
 
+db.exec(`
+  CREATE TABLE IF NOT EXISTS adaptations (
+    id              TEXT PRIMARY KEY,
+    type            TEXT NOT NULL,
+    target          TEXT NOT NULL,
+    rule            TEXT NOT NULL,
+    why             TEXT,
+    strength        REAL DEFAULT 1.0,
+    stability       REAL DEFAULT 1.0,
+    challenge_count INTEGER DEFAULT 0,
+    revision_count  INTEGER DEFAULT 0,
+    created_by      TEXT DEFAULT 'environment',
+    created_at      TEXT DEFAULT (datetime('now')),
+    updated_at      TEXT DEFAULT (datetime('now'))
+  );
+`);
+
 // --- FTS5 виртуальная таблица для полнотекстового поиска ---
 
 db.exec(`
