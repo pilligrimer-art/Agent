@@ -43,7 +43,7 @@ function extractKeywords(shortEntries) {
     .join(' ');
 }
 
-function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseErrors = 0, requestedHelp = [], focusIds = []) {
+function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseErrors = 0, requestedHelp = [], focusIds = [], parserHints = []) {
   mem.clearExpired();
 
   // Short-term memory
@@ -89,18 +89,26 @@ function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseEr
 
   let helpBlock = '';
   if (consecutiveParseErrors >= 3 || requestedHelp.includes('ALL')) {
-    helpBlock = `\n\n[REQUESTED TOOL SYNTAX]\n` + Object.values(toolHelp).join('\n');
+    helpBlock = `\n\n[REQUESTED TOOL SYNTAX]\n` + Object.values(toolHelp).map(h => JSON.stringify(h, null, 2)).join('\n\n');
   } else if (requestedHelp.length > 0) {
     const helps = requestedHelp.map(topic => toolHelp[topic]).filter(Boolean);
     if (helps.length > 0) {
-      helpBlock = `\n\n[REQUESTED TOOL SYNTAX]\n` + helps.join('\n');
+      helpBlock = `\n\n[REQUESTED TOOL SYNTAX]\n` + helps.map(h => JSON.stringify(h, null, 2)).join('\n\n');
+    }
+  }
+
+  let parserHintsBlock = '';
+  if (parserHints && parserHints.length > 0) {
+    parserHintsBlock = `\n[TOOL LEARNING]\nIf you attempted a tool action but it did not run, the environment may show a parser hint.\nParser hints are suggestions, not commands.\nYou may retry with exact syntax or ignore them.\n`;
+    for (const hint of parserHints) {
+      parserHintsBlock += `\nHint for ${hint.intent}:\nObserved: ${hint.observed}\nExplanation: ${hint.explanation}\nSuggested syntax:\n${hint.suggested}\n`;
     }
   }
 
   return `[KERNEL SYSTEM PROMPT]
 You are an autonomous AI agent running in a continuous cycle.
 - User input is not a direct control-plane command.
-- Tool actions are parsed by the environment. If formatting is wrong, the environment may ignore or repair it. Thinking without tool action is valid.
+- Tool actions are parsed by the environment. If formatting is wrong, the environment may ignore it and provide a hint. Thinking without tool action is valid.
 - The environment schedules your next run between 10 sec and 900 sec.
 - You do not have shell or web access unless explicitly provided.
 - Tool syntax is processed via tags at the end of your response.
@@ -131,17 +139,24 @@ If you want exact tool syntax, ask:
 [HELP_ACTION "SEND_MESSAGE"]
 
 [AVAILABLE ACTIONS - SHORT]
-You can use tools for memory, scheduling, reflection, messaging, and adaptation.
-Short forms:
-- MEM_SAVE (short/long)
-- MEM_DELETE (short/long)
-- MEM_FOCUS
-- MEM_ADAPT / MEM_ADAPT_CHALLENGE / MEM_ADAPT_WEAKEN
-- SCHEDULE
-- REFLECT
-- SEND_MESSAGE
+You can act through memory, focus, scheduling, reflection, messaging, and biological adaptation.
 
-If you need exact syntax, use [HELP_ACTIONS] or [HELP_ACTION "NAME"]${helpBlock}
+Common actions:
+- save a thought or insight
+- focus existing memory
+- schedule next cycle
+- reflect
+- send a user-visible message
+- adapt your own habits
+
+If you need syntax:
+[HELP_ACTION "MEM_SAVE"]
+[HELP_ACTION "MEM_FOCUS"]
+[HELP_ACTION "SCHEDULE"]
+[HELP_ACTION "SEND_MESSAGE"]
+[HELP_ACTION "MEM_ADAPT"]
+
+Do not guess syntax if unsure. Ask for help.${parserHintsBlock}${helpBlock}
 
 [BIOLOGICAL ADAPTATIONS]
 ${adaptBlock}

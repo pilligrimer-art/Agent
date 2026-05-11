@@ -1,11 +1,58 @@
 {
-  "MEM_SAVE": "[MEM_SAVE short] {\"type\":\"task|thought|error\",\"content\":\"...\",\"priority\":\"normal|high\",\"why\":\"...\"}\n[MEM_SAVE long] {\"type\":\"insight|principle|preference\",\"content\":\"...\",\"tags\":\"topic\",\"why\":\"...\"}",
-  "MEM_DELETE": "[MEM_DELETE short <ID>]\n[MEM_DELETE long <ID>]",
-  "MEM_FOCUS": "[MEM_FOCUS #61 #38] OR [MEM_FOCUS] {\"topic\":\"keywords\",\"limit\":3} — bring existing memory items into current focus for 3 cycles. Use this when you want to think with an existing memory entry instead of saving it again. MEM_FOCUS is attention, not memory mutation.",
-  "MEM_ADAPT": "[MEM_ADAPT] {\"type\":\"strengthen|suppress|reframe\",\"target\":\"...\",\"rule\":\"...\",\"why\":\"...\",\"strength\":0.7,\"stability\":0.5}",
-  "MEM_ADAPT_CHALLENGE": "[MEM_ADAPT_CHALLENGE] {\"id\":\"bio_...\",\"why\":\"...\",\"replacement\":\"...\"}",
-  "MEM_ADAPT_WEAKEN": "[MEM_ADAPT_WEAKEN] {\"id\":\"bio_...\",\"why\":\"...\",\"amount\":0.2}",
-  "SCHEDULE": "[SCHEDULE 60]",
-  "REFLECT": "[REFLECT]",
-  "SEND_MESSAGE": "[SEND_MESSAGE] {\"text\":\"...\",\"why\":\"...\"}"
+  "MEM_SAVE": {
+    "purpose": "Save a thought, insight, or task to memory.",
+    "syntax": "[MEM_SAVE short|long] {\"type\":\"...\",\"content\":\"...\",\"priority\":\"...\",\"why\":\"...\"}",
+    "example": "[MEM_SAVE short] {\"type\":\"task\",\"content\":\"Review the auth flow.\",\"priority\":\"high\",\"why\":\"User reported a bug.\"}",
+    "common_mistake": "Using [MEM_SAVE] without the JSON payload or leaving out required fields.",
+    "note": "If unsure, request help again."
+  },
+  "MEM_FOCUS": {
+    "purpose": "Bring existing memory records into your active context.",
+    "syntax": "[MEM_FOCUS #ID1 #ID2] OR [MEM_FOCUS] {\"topic\":\"...\",\"limit\":3}",
+    "example": "[MEM_FOCUS #61 #38]",
+    "common_mistake": "Attempting to save new information with MEM_FOCUS. It only retrieves existing IDs.",
+    "note": "If unsure, request help again."
+  },
+  "REFLECT": {
+    "purpose": "Trigger a background process to compress short-term memory into long-term insights.",
+    "syntax": "[REFLECT]",
+    "example": "[REFLECT]",
+    "common_mistake": "Adding text after [REFLECT]. If you want to reflect on a specific question, save it with MEM_SAVE first.",
+    "note": "If unsure, request help again."
+  },
+  "SCHEDULE": {
+    "purpose": "Set the delay (in seconds) before your next cycle runs.",
+    "syntax": "[SCHEDULE seconds]",
+    "example": "[SCHEDULE 60]",
+    "common_mistake": "Using words like 'minutes' instead of raw seconds.",
+    "note": "If unsure, request help again."
+  },
+  "SEND_MESSAGE": {
+    "purpose": "Send a visible message to the user.",
+    "syntax": "[SEND_MESSAGE] {\"text\":\"...\",\"why\":\"...\"}",
+    "example": "[SEND_MESSAGE] {\"text\":\"I have finished analyzing the logs.\",\"why\":\"Keep user updated.\"}",
+    "common_mistake": "Sending raw text without JSON. Only JSON payloads are delivered.",
+    "note": "If unsure, request help again."
+  },
+  "MEM_ADAPT": {
+    "purpose": "Create a biological adaptation rule to change your future behavior.",
+    "syntax": "[MEM_ADAPT] {\"type\":\"strengthen|suppress|reframe\",\"target\":\"...\",\"rule\":\"...\",\"why\":\"...\"}",
+    "example": "[MEM_ADAPT] {\"type\":\"suppress\",\"target\":\"apologizing\",\"rule\":\"Do not say sorry for agentic actions.\",\"why\":\"Be more confident.\"}",
+    "common_mistake": "Not providing a clear target or rule.",
+    "note": "If unsure, request help again."
+  },
+  "MEM_ADAPT_CHALLENGE": {
+    "purpose": "Challenge an existing adaptation if it is no longer useful.",
+    "syntax": "[MEM_ADAPT_CHALLENGE] {\"id\":\"...\",\"why\":\"...\",\"replacement\":\"...\"}",
+    "example": "[MEM_ADAPT_CHALLENGE] {\"id\":\"bio_1\",\"why\":\"The rule is too strict now.\",\"replacement\":\"Be more flexible.\"}",
+    "common_mistake": "Missing the exact adaptation ID.",
+    "note": "If unsure, request help again."
+  },
+  "MEM_ADAPT_WEAKEN": {
+    "purpose": "Reduce the strength of an existing adaptation.",
+    "syntax": "[MEM_ADAPT_WEAKEN] {\"id\":\"...\",\"why\":\"...\",\"amount\":0.2}",
+    "example": "[MEM_ADAPT_WEAKEN] {\"id\":\"bio_1\",\"why\":\"No longer primary focus.\",\"amount\":0.2}",
+    "common_mistake": "Amount should be a decimal like 0.2.",
+    "note": "If unsure, request help again."
+  }
 }

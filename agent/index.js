@@ -46,7 +46,8 @@ const memState = {
   lastReflectTime: 0,
   consecutiveParseErrors: 0,
   requestedHelp: [],
-  focusItems: []
+  focusItems: [],
+  parserHints: []
 };
 
 function pushUserMessage(text) {
@@ -257,7 +258,14 @@ async function runAgent() {
   const messages = [...memState.pendingMessages];
   memState.pendingMessages = [];
 
-  const prompt = buildContext(memState.thoughtHistory, messages, memState.consecutiveParseErrors, memState.requestedHelp, memState.focusItems.map(f => f.id));
+  const prompt = buildContext(
+    memState.thoughtHistory,
+    messages,
+    memState.consecutiveParseErrors,
+    memState.requestedHelp,
+    memState.focusItems.map(f => f.id),
+    memState.parserHints
+  );
   let response = '';
   let parsed = null;
   let error = null;
@@ -306,6 +314,7 @@ async function runAgent() {
 
     nextScheduleSec = Math.min(parsed.scheduleSec, 900); // max 15 минут
     memState.requestedHelp = parsed.helpRequests || [];
+    memState.parserHints = parsed.parserHints || [];
 
     // Обновление фокуса
     for (let i = memState.focusItems.length - 1; i >= 0; i--) {

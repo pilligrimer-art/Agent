@@ -19,8 +19,7 @@ const config = {
   rootDir,
   ollamaHost:           process.env.OLLAMA_HOST || 'http://localhost:11434',
   modelName:            process.env.MODEL_NAME  || 'gemma3:4b',
-  defaultIntervalSec:   intEnv('DEFAULT_INTERVAL_SEC', 10),
-  
+  defaultIntervalSec:   intEnv('DEFAULT_INTERVAL_SEC', 60),
   // 60% Рабочий контекст: последние мысли
   maxHistoryInContext:  intEnv('MAX_HISTORY_IN_CONTEXT', 1),
   
