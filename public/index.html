@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Autonomous Agent Control</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Агент на базе Ollama</h1>
+            <div class="status-badge" id="agent-status">Idle</div>
+            <button id="run-btn" class="primary-btn">Форсировать цикл</button>
+        </header>
+
+        <div class="grid">
+            <section class="card">
+                <h2>Состояние</h2>
+                <div class="stat-grid">
+                    <div class="stat">
+                        <span class="label">Модель</span>
+                        <span class="value" id="stat-model">-</span>
+                    </div>
+                    <div class="stat">
+                        <span class="label">Запусков (Web)</span>
+                        <span class="value" id="stat-runs">-</span>
+                    </div>
+                    <div class="stat">
+                        <span class="label">Следующий</span>
+                        <span class="value" id="stat-next">-</span>
+                    </div>
+                    <div class="stat">
+                        <span class="label">Последний</span>
+                        <span class="value" id="stat-last">-</span>
+                    </div>
+                </div>
+                <div class="thought-box" id="last-thought">
+                    <em>Здесь появится последняя мысль агента...</em>
+                </div>
+            </section>
+
+            <section class="card chat-card">
+                <h2>Связь с агентом</h2>
+                <div class="chat-history" id="chat-history">
+                    <div class="chat-msg system">Отправьте сообщение агенту. Он увидит его и проанализирует в начале своего следующего цикла мышления.</div>
+                </div>
+                <div class="chat-input-group">
+                    <input type="text" id="chat-input" placeholder="Написать сообщение..." class="search-input">
+                    <button id="send-msg-btn" class="primary-btn">Отправить</button>
+                </div>
+            </section>
+
+            <section class="card">
+                <h2>Краткосрочная память (<span id="short-count">0</span>)</h2>
+                <div class="memory-list" id="short-mem-list"></div>
+            </section>
+
+            <section class="card">
+                <div class="card-header">
+                    <h2>Долгосрочная память (<span id="long-count">0</span>)</h2>
+                    <input type="text" id="search-ltm" placeholder="Поиск..." class="search-input">
+                </div>
+                <div class="memory-list" id="long-mem-list"></div>
+            </section>
+
+            <section class="card" style="grid-column: 1 / -1;">
+                <h2>Логи сессий</h2>
+                <div class="log-list" id="log-list" style="max-height: 200px; display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 0.5rem;"></div>
+            </section>
+        </div>
+    </div>
+    <script src="app.js"></script>
+</body>
+</html>
