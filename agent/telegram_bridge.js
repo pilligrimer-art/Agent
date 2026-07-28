@@ -159,11 +159,11 @@ class TelegramBridge {
       console.log(`[TELEGRAM] ✅ Авто-определение Chat ID: ${this.chatId}`);
     }
 
-    // 1. Новое сообщение от пользователя
-    if (msg) {
+    // 1. Новое сообщение от пользователя (игнорируем собственные сообщения бота)
+    if (msg && msg.from && !msg.from.is_bot) {
       const text = msg.text || '';
       const replyTo = msg.reply_to_message;
-      const user = msg.from ? (msg.from.username || msg.from.first_name) : 'User';
+      const user = msg.from.username || msg.from.first_name || 'User';
 
       if (replyTo) {
         this.pendingUserReplies.set(msg.message_id, {
