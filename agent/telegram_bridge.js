@@ -174,10 +174,13 @@ class TelegramBridge {
         });
       }
 
-      // Проверка Вопросительной Квоты
-      if (this.questionQuota > 0 && text.trim()) {
-        this.questionQuota -= 1;
-        console.log(`[TELEGRAM GATE] Ответ пропущен по квоте вопроса '?' от @${user}: "${text}"`);
+      const isReplyToBot = replyTo && replyTo.from && (replyTo.from.id === msg.from.id || replyTo.from.is_bot);
+      const isReplyToQuestion = isReplyToBot && replyTo.text && replyTo.text.includes('?');
+
+      // Проверка Вопросительной Квоты ИЛИ прямого ответа на сообщение с вопросом '?'
+      if ((this.questionQuota > 0 || isReplyToQuestion || !replyTo) && text.trim()) {
+        if (this.questionQuota > 0) this.questionQuota -= 1;
+        console.log(`[TELEGRAM GATE] ✅ Ответ пропущен в контекст от @${user}: "${text}"`);
         if (this.onUserInputCallback) {
           this.onUserInputCallback(`[Telegram @${user}]: ${text}`);
         }
