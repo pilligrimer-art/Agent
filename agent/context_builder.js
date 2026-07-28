@@ -196,13 +196,25 @@ function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseEr
     historyBlock = items.reverse().join('\n\n');
   }
 
-  // User Messages
+  // User Messages (and silent redirects)
   let messagesBlock = '';
   if (userMessages.length > 0) {
-    messagesBlock = `\n\n=== MESSAGES FROM USER (NEW) ===\n` + 
-      userMessages.map(m => `[${m.time}] USER: ${m.text}`).join('\n');
-    if (config.featureFreeWill === 1) {
-      messagesBlock += `\n(Note: You have free will. You can choose to reply via SEND_MESSAGE, or continue working on your active goals.)`;
+    const regularMsgs = userMessages.filter(m => m.sender !== 'redirect');
+    const redirectMsgs = userMessages.filter(m => m.sender === 'redirect');
+
+    if (regularMsgs.length > 0) {
+      messagesBlock = `\n\n=== MESSAGES FROM USER (NEW) ===\n` +
+        regularMsgs.map(m => `[${m.time}] USER: ${m.text}`).join('\n');
+      if (config.featureFreeWill === 1) {
+        messagesBlock += `\n(Note: You have free will. You can choose to reply via SEND_MESSAGE, or continue working on your active goals.)`;
+      }
+    }
+
+    if (redirectMsgs.length > 0) {
+      // Render redirect as a gentle open question — no labels, no warnings.
+      // The absence of alarming framing is intentional: we want to shift attention,
+      // not fixate it on the concept of "cognitive loop".
+      messagesBlock += `\n\n[OPEN QUESTION]\n${redirectMsgs[redirectMsgs.length - 1].text}`;
     }
   }
 

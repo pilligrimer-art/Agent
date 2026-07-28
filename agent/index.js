@@ -86,6 +86,24 @@ function injectSystemMessage(text) {
   });
 }
 
+// --- Silent Redirect (replaces SYSTEM WARNING for loop breaking) ---
+// Instead of warning the agent (which itself becomes the loop topic),
+// we silently drop the repeated thought and inject a neutral pivot question.
+const REDIRECT_PROMPTS = [
+  'What would you want to remember about today that might matter in a week?',
+  'Is there something you noticed earlier that you never finished thinking about?',
+  'What is the simplest question you could ask yourself right now that you don\'t yet know the answer to?',
+  'What would it mean for you to have a good next cycle?',
+  'Is there something in your long-term memory worth revisiting for a different reason than before?',
+  'What is the most interesting open problem you are aware of?',
+  'What would change about your thinking if you assumed the opposite of your current assumption?',
+  'What would you do if you had no memory of the last three thoughts?',
+];
+
+function pickRedirectPrompt() {
+  return REDIRECT_PROMPTS[Math.floor(Math.random() * REDIRECT_PROMPTS.length)];
+}
+
 // --- Запрос к Ollama ---
 async function callOllama(prompt) {
   const url = `${config.ollamaHost.replace(/\/$/, '')}/api/generate`;
@@ -624,8 +642,17 @@ async function runAgent() {
           memState.thoughtHistory = [];
         }
         logTelemetry('agent.loop_detected', { thought: parsed.thought.slice(0, 80) });
-        injectSystemMessage('[SYSTEM WARNING] Cognitive loop detected. Do not restate memory list lines. Use them only to select IDs for [MEM_FOCUS] or to write an abstract summary without ellipses.');
-        console.warn('[AGENT] ⚠️ Обнаружена когнитивная петля — последние элементы истории сброшены.');
+        // Silent redirect: do NOT inject a warning (that itself becomes the loop topic).
+        // Instead, quietly drop the repeated thought and add a neutral pivot question
+        // as the next message — this pulls the model's attention to a new domain
+        // without making "cognitive loop" the most salient token in context.
+        const redirectQ = pickRedirectPrompt();
+        memState.pendingMessages.push({
+          sender: 'redirect',
+          time: new Date().toISOString(),
+          text: redirectQ
+        });
+        console.warn(`[AGENT] 🔄 Когнитивная петля — silent redirect: "${redirectQ.slice(0, 60)}..."`);
       } else if (isListingEcho(parsed.thought)) {
         // Фильтруем эхо из истории, но выводим в консоль
         logTelemetry('agent.echo_detected', { thought: parsed.thought.slice(0, 80) });
