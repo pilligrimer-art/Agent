@@ -31,14 +31,20 @@ db.exec(`
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS long_mem (
-    id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    type      TEXT NOT NULL,
-    content   TEXT NOT NULL,
-    tags      TEXT DEFAULT '',
-    created   TEXT DEFAULT (datetime('now')),
-    source    TEXT DEFAULT NULL
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    type          TEXT NOT NULL,
+    content       TEXT NOT NULL,
+    tags          TEXT DEFAULT '',
+    created       TEXT DEFAULT (datetime('now')),
+    source        TEXT DEFAULT NULL,
+    access_count  INTEGER DEFAULT 0,
+    last_accessed TEXT DEFAULT (datetime('now'))
   );
 `);
+
+// Миграция для старых БД (игнорируем ошибки если колонки уже есть)
+try { db.exec("ALTER TABLE long_mem ADD COLUMN access_count INTEGER DEFAULT 0;"); } catch(e) {}
+try { db.exec("ALTER TABLE long_mem ADD COLUMN last_accessed TEXT DEFAULT (datetime('now'));"); } catch(e) {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS adaptations (

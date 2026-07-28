@@ -1,4 +1,4 @@
-﻿const db = require('./db');
+const db = require('./db');
 const config = require('./config');
 
 // --- Подготовленные выражения (кешируются при первом вызове) ---
@@ -46,8 +46,14 @@ const stmtSearchLong = db.prepare(`
   SELECT long_mem.* FROM long_mem
     JOIN long_mem_fts ON long_mem.id = long_mem_fts.rowid
     WHERE long_mem_fts MATCH ?
-    ORDER BY rank
+    ORDER BY rank + (COALESCE(long_mem.access_count, 0) * 0.5) ASC
     LIMIT ?
+`);
+
+const stmtUpdateAccess = db.prepare(`
+  UPDATE long_mem 
+  SET access_count = COALESCE(access_count, 0) + 1, last_accessed = datetime('now')
+  WHERE id = ?
 `);
 
 const stmtClearExpired = db.prepare(
@@ -188,7 +194,12 @@ function searchLongMem(keywords, limit) {
 
   try {
     const results = stmtSearchLong.all(ftsQuery, limit || config.maxLongMemInContext);
-    if (results.length > 0) return results;
+    if (results.length > 0) {
+      for (const r of results) {
+        stmtUpdateAccess.run(r.id);
+      }
+      return results;
+    }
   } catch (_) {
     // FTS5 запрос может упасть при некорректных символах — fallback
   }
@@ -230,6 +241,7 @@ function getRecordsByIds(ids) {
       const rec = stmtGetLongById.get(numId);
       if (rec) {
         rec.memory_type = 'long';
+        stmtUpdateAccess.run(numId);
         results.push(rec);
       }
     } else {
