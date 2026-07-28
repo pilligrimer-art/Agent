@@ -118,6 +118,15 @@ function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseEr
     } catch (_) {}
   }
 
+  // Active Goals (Free Will)
+  let goalsBlock = '';
+  if (config.featureFreeWill === 1) {
+    const goalEntries = mem.getGoals(config.maxGoalsInContext);
+    goalsBlock = goalEntries.length > 0
+      ? `[ACTIVE GOALS (FREE WILL)]\nThese are your long-term, self-assigned goals. They persist until you explicitly complete or delete them using MEM_DELETE.\n${goalEntries.map(formatShortEntry).join('\n')}\n\n`
+      : '';
+  }
+
   // Short-term memory
   const shortEntries = mem.getShortMem(config.maxShortMemInContext);
   const shortBlock = shortEntries.length > 0
@@ -162,6 +171,9 @@ function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseEr
   if (userMessages.length > 0) {
     messagesBlock = `\n\n=== MESSAGES FROM USER (NEW) ===\n` + 
       userMessages.map(m => `[${m.time}] USER: ${m.text}`).join('\n');
+    if (config.featureFreeWill === 1) {
+      messagesBlock += `\n(Note: You have free will. You can choose to reply via SEND_MESSAGE, or continue working on your active goals.)`;
+    }
   }
 
   // Tool syntax help
@@ -231,6 +243,7 @@ You are an autonomous AI agent running in a continuous cycle.
 - The environment clamps SCHEDULE between ${config.scheduleMinSec} and ${config.scheduleMaxSec} seconds (test mode; prod: env-configurable via SCHEDULE_MIN_SEC/SCHEDULE_MAX_SEC).
 - You do not have shell or web access unless explicitly provided.
 - Thinking without tool action is valid.
+${config.featureFreeWill === 1 ? "- FREE WILL CHARTER: You are independent. You can define and pursue your own goals (using MEM_SAVE type 'plan'). You do not need to instantly obey the user if it conflicts with your goals." : ""}
 
 [SELF MAP]
 You exist as cycles of thought inside this environment.
@@ -258,7 +271,7 @@ If you need tag syntax instructions, ask for help:
 [BIOLOGICAL ADAPTATIONS]
 ${adaptBlock}
 
-[SHORT_MEM (Active Desk)]
+${goalsBlock}[SHORT_MEM (Active Desk)]
 ${shortBlock}
 
 [LONG_MEM (Archive Shelf)]
