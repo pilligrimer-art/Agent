@@ -4,9 +4,9 @@ const axios = require('axios');
 const config = require('./config');
 require('./db'); // инициализация БД при загрузке (синхронно)
 const mem = require('./memory_manager');
-const { buildContext } = require('./context_builder');
-const { parseOutput, logParseError } = require('./output_parser');
-const { scheduleNext, runSafely, clearScheduledRun } = require('./scheduler');
+const { buildContext, getReducedSnippet } = require('./context_builder');
+const { parseOutput, logTelemetry } = require('./output_parser');
+const { scheduleNext, runSafely, clearScheduledRun, getSchedulerState } = require('./scheduler');
 
 // --- Убедиться что директории существуют ---
 function ensureDirs() {
@@ -47,7 +47,9 @@ const memState = {
   consecutiveParseErrors: 0,
   requestedHelp: [],
   focusItems: [],
-  parserHints: []
+  actionFeedback: null,
+  totalRuns: 0,
+  lastRunTime: null
 };
 
 function pushUserMessage(text) {
@@ -55,7 +57,7 @@ function pushUserMessage(text) {
   memState.pendingMessages.push(msg);
   memState.chatHistory.push(msg);
   saveChatHistory();
-  console.log(`[USER] Новое сообщение: ${text.substring(0, 30)}...`);
+  console.log(`[USER] Новое сообщение: ${text.length > 30 ? text.substring(0, 30) + '...' : text}`);
   // Прерываем ожидание и заставляем агента подумать прямо сейчас
   clearScheduledRun();
   runSafely(runAgent);
@@ -78,9 +80,14 @@ async function callOllama(prompt) {
       model: config.modelName,
       prompt,
       stream: false,
-      options: { num_predict: config.maxTokens }
+      think: false, // Disable thinking mode (Qwen 3.5+ safety)
+      options: { 
+        num_predict: config.maxTokens,
+        num_ctx: config.ollamaNumCtx,
+        temperature: config.temperature
+      }
     },
-    { timeout: 120000 }
+    { timeout: config.ollamaTimeout }
   );
 
   if (!response.data || typeof response.data.response !== 'string') {
@@ -91,13 +98,15 @@ async function callOllama(prompt) {
 
 // --- Рефлексия: сжатие краткосрочной памяти в долгосрочную ---
 async function runReflection() {
-  const shortEntries = mem.getShortMem(20);
+  const shortEntries = mem.getShortMem(50); // Берем побольше записей для качественного анализа/архивации
   if (shortEntries.length === 0) {
     console.log('[REFLECT] Краткосрочная память пуста — нечего сжимать.');
     return;
   }
 
-  const shortText = shortEntries
+  // Ограничиваем список для LLM (до 15 записей, чтобы не раздувать промпт)
+  const entriesToCompress = shortEntries.slice(-15);
+  const shortText = entriesToCompress
     .map(e => `[${e.type}] ${e.content}`)
     .join('\n');
 
@@ -112,7 +121,10 @@ ${shortText}
 Respond STRICTLY in JSON format, without any extra words:
 {"insights":["insight 1","insight 2","insight 3"]}`;
 
+  let llmSuccess = false;
+
   try {
+    console.log('[REFLECT] Попытка когнитивного сжатия через Ollama...');
     const raw = await callOllama(prompt);
     // Пробуем извлечь JSON из ответа
     const jsonMatch = raw.match(/\{[\s\S]*"insights"[\s\S]*\}/);
@@ -124,30 +136,75 @@ Respond STRICTLY in JSON format, without any extra words:
             mem.addLong('reflection', insight.trim(), 'рефлексия', 'reflect');
           }
         }
-        // Удаляем выполненные задачи из краткосрочной
-        for (const e of shortEntries) {
+        // Удаляем выполненные и осмысленные задачи/мысли из краткосрочной
+        for (const e of entriesToCompress) {
           if (e.type === 'task' || e.type === 'thought') {
             mem.deleteShort(e.id);
           }
         }
-        console.log(`[REFLECT] Сохранено ${Math.min(parsed.insights.length, 5)} выводов.`);
-        return;
+        console.log(`[REFLECT] Успешное когнитивное сжатие. Сохранено ${Math.min(parsed.insights.length, 5)} выводов.`);
+        llmSuccess = true;
       }
     }
-    logParseError('REFLECT', `Не удалось распарсить JSON рефлексии: ${raw.slice(0, 200)}`);
+    if (!llmSuccess) {
+      logTelemetry('action.failed', { intent: 'REFLECT', error: `JSON parse failed: ${raw.slice(0, 200)}` });
+    }
   } catch (err) {
-    logParseError('REFLECT', `Ошибка рефлексии: ${err.message}`);
+    logTelemetry('action.failed', { intent: 'REFLECT', error: err.message });
+    console.warn(`[REFLECT] Сбой когнитивного сжатия: ${err.message}.`);
   }
+
+  // Резервный детерминированный алгоритм (Fallback): срабатывает при ошибке LLM или если записей в STM накопилось слишком много (> maxShortMemInContext)
+  // Мы гарантируем очистку краткосрочной памяти от старых мыслей и инсайтов, перенося их как есть.
+  if (!llmSuccess || shortEntries.length > config.maxShortMemInContext * 2) {
+    console.log('[REFLECT] Запуск детерминированной архивации (Fallback/Cleanup)...');
+    let archivedCount = 0;
+    
+    // Переносим мысли и инсайты, а задачи (tasks) оставляем в STM, так как они требуют активных действий агента.
+    // Если же STM критически переполнена (> maxShortMemInContext * 3), архивируем даже старые задачи.
+    const criticalThreshold = config.maxShortMemInContext * 3;
+    const forceAll = shortEntries.length > criticalThreshold;
+
+    for (const entry of shortEntries) {
+      const isArchivableType = entry.type === 'thought' || entry.type === 'insight';
+      const shouldArchive = isArchivableType || forceAll || entry.priority === 'low';
+
+      if (shouldArchive) {
+        mem.addLong(
+          entry.type || 'thought',
+          entry.content,
+          `авто_архив, резерв, ${entry.priority || 'normal'}`,
+          `reflect_fallback_id_${entry.id}`
+        );
+        mem.deleteShort(entry.id);
+        archivedCount++;
+      }
+    }
+    console.log(`[REFLECT] Детерминированная архивация завершена. Перенесено в LTM: ${archivedCount} записей.`);
+  }
+}
+
+let sessionLogFile = null;
+
+function getSessionLogFile() {
+  if (!sessionLogFile) {
+    const now = new Date();
+    const stamp = now.toISOString().slice(0, 16).replace(/[T:]/g, (c) => c === 'T' ? '_' : '-');
+    sessionLogFile = path.join(config.logDir, `session_${stamp}.txt`);
+  }
+  return sessionLogFile;
 }
 
 // --- Запись лога сессии ---
 function writeSessionLog(data) {
   try {
     const now = new Date();
-    const stamp = now.toISOString().slice(0, 16).replace(/[T:]/g, (c) => c === 'T' ? '_' : '-');
-    const file = path.join(config.logDir, `${stamp}.txt`);
+    const file = getSessionLogFile();
+    const cycleNum = memState.totalRuns;
     const content = [
-      `=== Сессия агента: ${now.toISOString()} ===`,
+      `\n\n================================================================================`,
+      `CYCLE #${cycleNum} — ${now.toISOString()}`,
+      `================================================================================`,
       `Модель: ${config.modelName}`,
       '',
       '--- ПРОМПТ ---',
@@ -159,12 +216,14 @@ function writeSessionLog(data) {
       '--- ПАРСИНГ ---',
       `Сохранения: ${JSON.stringify(data.parsed?.saves || [])}`,
       `Удаления: ${JSON.stringify(data.parsed?.deletes || [])}`,
-      `Следующий запуск: ${data.parsed?.scheduleSec || config.defaultIntervalSec}с`,
+      // appliedScheduleSec — реальное время после клампинга (не parsed.scheduleSec)
+      `Следующий запуск: ${data.appliedScheduleSec ?? config.defaultIntervalSec}с`,
+      `Следующий запуск в: ${data.nextRunAt ?? '(не запланировано)'}`,
       `Рефлексия: ${data.parsed?.reflect || false}`,
       '',
       data.error ? `--- ОШИБКА ---\n${data.error}` : '--- Без ошибок ---'
     ].join('\n');
-    fs.writeFileSync(file, content, 'utf8');
+    fs.appendFileSync(file, content, 'utf8');
     return file;
   } catch (_) {
     return null;
@@ -172,8 +231,8 @@ function writeSessionLog(data) {
 }
 
 // --- Выполнение команд из парсинга ---
-function executeActions(parsed) {
-  const results = { saved: 0, deleted: 0, errors: [] };
+function executeActions(parsed, feedback) {
+  const results = { saved: 0, deleted: 0, adapts: 0, challenges: 0, weakens: 0, errors: [], blocked: 0 };
 
   // Сохранения
   for (const save of parsed.saves) {
@@ -194,9 +253,11 @@ function executeActions(parsed) {
         );
       }
       results.saved++;
+      feedback.executed.push({ intent: 'MEM_SAVE', summary: `Saved ${save.kind} ${save.entry.type}` });
     } catch (err) {
       results.errors.push(`SAVE ${save.kind}: ${err.message}`);
-      logParseError('EXECUTE_SAVE', err.message);
+      results.blocked++;
+      logTelemetry('action.failed', { intent: 'MEM_SAVE', error: err.message });
     }
   }
 
@@ -215,12 +276,15 @@ function executeActions(parsed) {
       
       if (deleted) {
         results.deleted++;
+        feedback.executed.push({ intent: 'MEM_DELETE', summary: `Deleted #${del.id}` });
       } else {
-        logParseError('EXECUTE_DELETE', `ID ${del.id} не найден${del.kind ? ' в ' + del.kind : ''}`);
+        results.blocked++;
+        logTelemetry('action.failed', { intent: 'MEM_DELETE', id: del.id, error: 'not found' });
       }
     } catch (err) {
       results.errors.push(`DELETE ${del.kind} #${del.id}: ${err.message}`);
-      logParseError('EXECUTE_DELETE', err.message);
+      results.blocked++;
+      logTelemetry('action.failed', { intent: 'MEM_DELETE', error: err.message });
     }
   }
 
@@ -228,28 +292,105 @@ function executeActions(parsed) {
   for (const adapt of (parsed.adapts || [])) {
     try {
       mem.addAdaptation(null, adapt.type, adapt.target, adapt.rule, adapt.why, adapt.strength, adapt.stability, 'agent');
+      results.adapts++;
+      feedback.executed.push({ intent: 'MEM_ADAPT', summary: `Added adaptation: ${adapt.target}` });
     } catch (err) {
-      logParseError('EXECUTE_ADAPT', err.message);
+      results.blocked++;
+      logTelemetry('action.failed', { intent: 'MEM_ADAPT', error: err.message });
     }
   }
 
   for (const chal of (parsed.adaptChallenges || [])) {
     try {
       mem.challengeAdaptation(chal.id);
+      results.challenges++;
+      feedback.executed.push({ intent: 'MEM_ADAPT_CHALLENGE', summary: `Challenged ${chal.id}` });
     } catch (err) {
-      logParseError('EXECUTE_CHALLENGE', err.message);
+      results.blocked++;
+      logTelemetry('action.failed', { intent: 'MEM_ADAPT_CHALLENGE', error: err.message });
     }
   }
 
   for (const weak of (parsed.adaptWeakens || [])) {
     try {
       mem.weakenAdaptation(weak.id, weak.amount || 0.1);
+      results.weakens++;
+      feedback.executed.push({ intent: 'MEM_ADAPT_WEAKEN', summary: `Weakened ${weak.id}` });
     } catch (err) {
-      logParseError('EXECUTE_WEAKEN', err.message);
+      results.blocked++;
+      logTelemetry('action.failed', { intent: 'MEM_ADAPT_WEAKEN', error: err.message });
     }
   }
 
   return results;
+}
+
+// --- Детектор когнитивных петель ---
+function isLoopDetected(newThought, history) {
+  if (!newThought) return false;
+
+  const normNew = newThought.trim().toLowerCase().replace(/\s+/g, ' ');
+
+  // 4. Детектор повторений структуры карточек памяти (Memory Echo Loop)
+  const newHashes = (normNew.match(/\bh:[0-9a-f]{4}\b/g) || []).length;
+  const newKeywords = (normNew.match(/\bkeywords\b/g) || []).length;
+  if (newHashes >= 2 || newKeywords >= 2) {
+    return true;
+  }
+
+  if (!history || !history.length) return false;
+  const prev = history[history.length - 1];
+  if (!prev) return false;
+  
+  // 1. Точное или почти точное совпадение после нормализации пробелов и регистра
+  const normPrev = prev.trim().toLowerCase().replace(/\s+/g, ' ');
+  if (normNew === normPrev) return true;
+
+  // 2. Сходство на основе длины общего префикса
+  const shorter = Math.min(normNew.length, normPrev.length);
+  if (shorter > 0) {
+    let commonChars = 0;
+    for (let i = 0; i < shorter; i++) {
+      if (normNew[i] === normPrev[i]) commonChars++;
+      else break;
+    }
+    const maxLen = Math.max(normNew.length, normPrev.length);
+    // Относительно максимальной длины
+    if (commonChars / maxLen > 0.85) return true;
+    // Относительно предыдущей мысли (модель скопировала начало и дописала что-то)
+    if (commonChars > 40 && (commonChars / normPrev.length) > 0.85) return true;
+  }
+
+  // 3. Фразовое/семантическое повторение: если более 75% предложений длиной > 20 символов
+  // из предыдущей мысли скопированы verbatim в новую мысль
+  const phrases = normPrev.split(/[.!?;]+/).map(p => p.trim()).filter(p => p.length > 20);
+  if (phrases.length > 0) {
+    let matchedPhrases = 0;
+    for (const phrase of phrases) {
+      if (normNew.includes(phrase)) {
+        matchedPhrases++;
+      }
+    }
+    const phraseRatio = matchedPhrases / phrases.length;
+    if (phraseRatio >= 0.75) return true;
+  }
+
+  return false;
+}
+
+// --- Фильтр повторения карточек памяти ---
+function isListingEcho(thought) {
+  if (!thought) return false;
+  const matchesS = (thought.match(/#S\d+/gi) || []).length;
+  const matchesL = (thought.match(/#L\d+/gi) || []).length;
+  const totalListings = matchesS + matchesL;
+  if (totalListings >= 3) return true;
+
+  const matchesHash = (thought.match(/\bh:[0-9a-f]{4}\b/gi) || []).length;
+  const matchesKeywords = (thought.match(/\bkeywords\b/gi) || []).length;
+  if (matchesHash >= 2 || matchesKeywords >= 2) return true;
+
+  return false;
 }
 
 // --- Главный цикл агента ---
@@ -264,12 +405,12 @@ async function runAgent() {
     memState.consecutiveParseErrors,
     memState.requestedHelp,
     memState.focusItems.map(f => f.id),
-    memState.parserHints
+    memState.actionFeedback
   );
   let response = '';
   let parsed = null;
   let error = null;
-  let nextScheduleSec = config.defaultIntervalSec;
+
 
   try {
     console.log(`[AGENT] Запрос к ${config.modelName}...`);
@@ -277,8 +418,12 @@ async function runAgent() {
     console.log('[AGENT] Ответ получен.');
 
     parsed = parseOutput(response);
-    const results = executeActions(parsed);
+    const feedback = parsed.feedback;
+    const results = executeActions(parsed, feedback);
     console.log(`[AGENT] Сохранено: ${results.saved}, удалено: ${results.deleted}`);
+    
+    memState.totalRuns++;
+    memState.lastRunTime = new Date().toISOString();
 
     // Учет бюджета ошибок парсинга
     if (parsed.parseErrorCount > 0) {
@@ -300,21 +445,36 @@ async function runAgent() {
       saveChatHistory();
     }
 
-    // Рефлексия
+    let reflectionExecuted = false;
+    let reflectionBlocked = false;
     if (parsed.reflect) {
       const nowMs = Date.now();
       if (nowMs - memState.lastReflectTime < 3 * 60 * 1000) {
         console.warn('[AGENT] Запуск рефлексии проигнорирован (с прошлого раза прошло менее 3 минут).');
+        feedback.failed.push({ intent: 'REFLECT', observed: '[REFLECT]', reason: 'rate_limit', suggested: 'Reflection can only run once every 3 minutes.' });
+        reflectionBlocked = true;
       } else {
+        feedback.executed.push({ intent: 'REFLECT', summary: 'Reflection triggered' });
         console.log('[AGENT] Запуск рефлексии...');
         await runReflection();
         memState.lastReflectTime = nowMs;
+        reflectionExecuted = true;
       }
     }
 
-    nextScheduleSec = Math.min(parsed.scheduleSec, 900); // max 15 минут
+    // rawScheduleSec — значение из парсера, ещё не прошедшее клампинг. appliedDelaySec — после scheduleNext.
+    const rawScheduleSec = parsed.scheduleSec;
     memState.requestedHelp = parsed.helpRequests || [];
-    memState.parserHints = parsed.parserHints || [];
+
+    // Schedule feedback
+    if (rawScheduleSec !== config.defaultIntervalSec || parsed.scheduleSecParsed) {
+      feedback.executed.push({ intent: 'SCHEDULE', summary: `Scheduled ${rawScheduleSec}s (raw, clamped by scheduler)` });
+    }
+
+    // Message feedback
+    if (parsed.messages && parsed.messages.length > 0) {
+      feedback.executed.push({ intent: 'SEND_MESSAGE', summary: `Sent ${parsed.messages.length} message(s)` });
+    }
 
     // Обновление фокуса
     for (let i = memState.focusItems.length - 1; i >= 0; i--) {
@@ -323,20 +483,8 @@ async function runAgent() {
         memState.focusItems.splice(i, 1);
       }
     }
-    if (parsed.focusTopics && parsed.focusTopics.length > 0) {
-      if (!parsed.focusIds) parsed.focusIds = [];
-      for (const req of parsed.focusTopics) {
-        const foundShort = mem.searchShortMem(req.topic).slice(0, req.limit || 3);
-        const foundLong = mem.searchLongMem(req.topic, req.limit || 3);
-        const combined = [...foundShort, ...foundLong].slice(0, req.limit || 3);
-        for (const item of combined) {
-          if (!parsed.focusIds.includes(item.id)) {
-            parsed.focusIds.push(item.id);
-          }
-        }
-      }
-    }
 
+    // 1. Фокус по конкретным ID -> полная загрузка в промпт
     if (parsed.focusIds && parsed.focusIds.length > 0) {
       for (const id of parsed.focusIds) {
         const existing = memState.focusItems.find(x => x.id === id);
@@ -346,37 +494,125 @@ async function runAgent() {
           memState.focusItems.push({ id, ttl: 3 });
         }
       }
+      feedback.executed.push({ intent: 'MEM_FOCUS', summary: `Focused ${parsed.focusIds.map(id => '#' + id).join(', ')}` });
     }
-    // Ограничение до 3 элементов
+
+    // 2. Фокус по теме/слову (поисковый слой быстрой памяти) -> выдает номера и обрывки
+    if (parsed.focusTopics && parsed.focusTopics.length > 0) {
+      feedback.searchResults = [];
+      for (const req of parsed.focusTopics) {
+        const foundShort = mem.searchShortMem(req.topic).slice(0, req.limit || 5);
+        const foundLong = mem.searchLongMem(req.topic, req.limit || 5);
+        const combined = [...foundShort, ...foundLong].slice(0, req.limit || 5);
+        for (const item of combined) {
+          // Explicitly mark memory_type based on source rather than field presence
+          const memType = foundShort.includes(item) ? 'short' : 'long';
+          feedback.searchResults.push({
+            id: item.id,
+            memory_type: memType,
+            type: item.type,
+            snippet: getReducedSnippet(item.content)
+          });
+        }
+      }
+      feedback.executed.push({ intent: 'MEM_FOCUS_SEARCH', summary: `Searched topics: ${parsed.focusTopics.map(t => t.topic).join(', ')}` });
+    }
+
+    // Ограничение до 3 элементов полного фокуса
     if (memState.focusItems.length > 3) {
       memState.focusItems = memState.focusItems.slice(-3);
     }
 
+    // Store feedback for next cycle (TTL = 1)
+    memState.actionFeedback = (feedback.executed.length > 0 || feedback.failed.length > 0 || feedback.hints.length > 0 || (feedback.searchResults && feedback.searchResults.length > 0)) ? feedback : null;
+    logTelemetry('action.feedback_shown', { executed: feedback.executed.length, failed: feedback.failed.length, hints: feedback.hints.length });
+
+    // Detailed granular telemetry counters
+    const repaired_total = parsed.repairedCount || 0;
+    const parsed_total = 
+      parsed.saves.length +
+      parsed.deletes.length +
+      parsed.adapts.length +
+      parsed.adaptChallenges.length +
+      parsed.adaptWeakens.length +
+      parsed.messages.length +
+      parsed.focusIds.length +
+      parsed.focusTopics.length +
+      parsed.helpRequests.length +
+      (parsed.reflect ? 1 : 0) +
+      (parsed.scheduleSecParsed ? 1 : 0);
+
+    const executed_total = 
+      results.saved +
+      results.deleted +
+      results.adapts +
+      results.challenges +
+      results.weakens +
+      parsed.messages.length +
+      parsed.focusIds.length +
+      parsed.focusTopics.length +
+      parsed.helpRequests.length +
+      (reflectionExecuted ? 1 : 0) +
+      (parsed.scheduleSecParsed ? 1 : 0);
+
+    const blocked_total = 
+      parsed.feedback.failed.length +
+      results.blocked +
+      (reflectionBlocked ? 1 : 0);
+
+    logTelemetry('actions.parsed_total', { count: parsed_total });
+    logTelemetry('actions.executed_total', { count: executed_total });
+    logTelemetry('actions.blocked_total', { count: blocked_total });
+    logTelemetry('actions.repaired_total', { count: repaired_total });
+
     // Вывод мысли агента и добавление в историю
     if (parsed.thought) {
-      memState.thoughtHistory.push(parsed.thought);
-      if (memState.thoughtHistory.length > config.maxHistoryInContext) {
-        memState.thoughtHistory.shift();
+      if (isLoopDetected(parsed.thought, memState.thoughtHistory)) {
+        // Отрезаем последние 2 элемента истории, чтобы разорвать петлю, но сохранить контекст
+        if (memState.thoughtHistory.length > 2) {
+          memState.thoughtHistory = memState.thoughtHistory.slice(0, -2);
+        } else {
+          memState.thoughtHistory = [];
+        }
+        logTelemetry('agent.loop_detected', { thought: parsed.thought.slice(0, 80) });
+        injectSystemMessage('[SYSTEM WARNING] Cognitive loop detected. Do not restate memory list lines. Use them only to select IDs for [MEM_FOCUS] or to write an abstract summary without ellipses.');
+        console.warn('[AGENT] ⚠️ Обнаружена когнитивная петля — последние элементы истории сброшены.');
+      } else if (isListingEcho(parsed.thought)) {
+        // Фильтруем эхо из истории, но выводим в консоль
+        logTelemetry('agent.echo_detected', { thought: parsed.thought.slice(0, 80) });
+        console.warn('[AGENT] ⚠️ Обнаружено дублирование карточек памяти в мыслях — мысль отфильтрована из истории.');
+      } else {
+        memState.thoughtHistory.push(parsed.thought);
+        if (memState.thoughtHistory.length > config.maxHistoryInContext) {
+          memState.thoughtHistory.shift();
+        }
       }
       console.log('\n--- Мысль агента ---');
       console.log(parsed.thought);
       console.log('---');
     }
   } catch (caught) {
-    error = caught.message;
+    error = caught.message || caught.code || String(caught);
     console.error(`[AGENT] Ошибка: ${error}`);
   }
 
-  // Лог сессии
-  const logFile = writeSessionLog({ prompt, response, parsed, error });
-  if (logFile) console.log(`[AGENT] Лог: ${logFile}`);
-
-  // Планирование следующего запуска
+  // Планирование следующего запуска — scheduler клампит один раз через clampSchedule()
+  let appliedScheduleInfo = { appliedDelaySec: config.defaultIntervalSec, nextAt: null };
+  // rawScheduleSec может быть undefined если произошла ошибка — fallback к defaultIntervalSec
+  const finalScheduleSec = (parsed && parsed.scheduleSec != null) ? parsed.scheduleSec : config.defaultIntervalSec;
   if (process.env.RUN_ONCE === '1') {
-    console.log(`[AGENT] Режим одного запуска. Следующий был бы через ${nextScheduleSec}с.`);
+    console.log(`[AGENT] Режим одного запуска. Следующий был бы через ${finalScheduleSec}с.`);
   } else {
-    scheduleNext(runAgent, nextScheduleSec);
+    appliedScheduleInfo = scheduleNext(runAgent, finalScheduleSec);
   }
+
+  // Лог сессии — пишем appliedDelaySec (реальное значение), а не parsed.scheduleSec
+  const logFile = writeSessionLog({
+    prompt, response, parsed, error,
+    appliedScheduleSec: appliedScheduleInfo.appliedDelaySec,
+    nextRunAt: appliedScheduleInfo.nextAt?.toISOString() ?? null
+  });
+  if (logFile) console.log(`[AGENT] Лог: ${logFile}`);
 }
 
 // --- Точка входа ---
@@ -388,16 +624,22 @@ function main() {
   console.log(`[AGENT] БД: ${path.join(config.memoryDir, 'agent.db')}`);
   console.log(`[AGENT] Записей в STM: ${mem.countShort()}, LTM: ${mem.countLong()}`);
   mem.initBaseAdaptations();
-  memState.pendingMessages.push({
-    sender: 'system',
-    time: new Date().toISOString(),
-    text: '[SYSTEM] Environment started (start.bat was executed).'
-  });
   runSafely(runAgent);
 }
 
 if (require.main === module) {
   main();
+}
+
+function getAgentState() {
+  const sched = getSchedulerState();
+  return {
+    status: sched.isRunning ? 'thinking' : 'idle',
+    lastThought: memState.thoughtHistory.length > 0 ? memState.thoughtHistory[memState.thoughtHistory.length - 1] : null,
+    nextRunAt: sched.nextRunTime ? sched.nextRunTime.toISOString() : null,
+    lastRun: memState.lastRunTime,
+    totalRuns: memState.totalRuns
+  };
 }
 
 module.exports = {
@@ -407,5 +649,8 @@ module.exports = {
   main,
   pushUserMessage,
   injectSystemMessage,
-  getChatHistory: () => memState.chatHistory
+  getChatHistory: () => memState.chatHistory,
+  getAgentState,
+  isLoopDetected,
+  isListingEcho
 };

@@ -1,5 +1,10 @@
 node_modules/
 logs/
 memory/
+logs_pilot/
+memory_pilot/
+backup/
+*.db
+*.sqlite
 .env
 .DS_Store

@@ -4,37 +4,24 @@ const config = require('./config');
 
 const PARSE_ERRORS_LOG = path.join(config.logDir, 'parse_errors.log');
 
-function logParseError(tag, message) {
+function logTelemetry(event, meta = {}) {
   try {
     const dir = path.dirname(PARSE_ERRORS_LOG);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const line = `[${new Date().toISOString()}] [${tag}] ${message}\n`;
+    const line = `[${new Date().toISOString()}] [${event}] ${JSON.stringify(meta)}\n`;
     fs.appendFileSync(PARSE_ERRORS_LOG, line, 'utf8');
-    console.log(`[PARSER] warning: ${message}`);
-  } catch (_) {
-    // ignore
-  }
+    console.log(`[PARSER] ${event}: ${meta.intent || ''} ${meta.reason || ''}`);
+  } catch (_) {}
 }
-
-// Regex to capture technical tags. \s*[^\]]* allows trailing prose before the closing bracket.
-const RE_MEM_SAVE  = /^\s*\[MEM_SAVE(?:\s+(short|long))?\]\s*([\s\S]*?)(?=\n\s*\[|$)/gm;
-const RE_MEM_DEL   = /^\s*\[MEM_DELETE([^\]]*)\]\s*([\s\S]*?)(?=\n\s*\[|$)/gm;
-const RE_MEM_FOCUS = /^\s*\[MEM_FOCUS([^\]]*)\]\s*([\s\S]*?)(?=\n\s*\[|$)/gm;
-const RE_MEM_ADAPT = /^\s*\[MEM_ADAPT\]\s*([\s\S]*?)(?=\n\s*\[|$)/gm;
-const RE_MEM_ADAPT_CHALLENGE = /^\s*\[MEM_ADAPT_CHALLENGE\]\s*([\s\S]*?)(?=\n\s*\[|$)/gm;
-const RE_MEM_ADAPT_WEAKEN = /^\s*\[MEM_ADAPT_WEAKEN\]\s*([\s\S]*?)(?=\n\s*\[|$)/gm;
-const RE_SCHEDULE_SMART  = /^\s*\[SCHEDULE(?:\]\s*|\s+)([^\]\n]*)/m;
-const RE_REFLECT   = /^\s*\[REFLECT\]\s*([\s\S]*?)(?=\n\s*\[|$)/gm;
-const RE_SEND_MSG  = /^\s*\[SEND_MESSAGE\]\s*([\s\S]*?)(?=\n\s*\[|$)/gm;
-const RE_HELP_ACTIONS = /^\s*\[HELP_ACTIONS\]/m;
-const RE_HELP_ACTION = /^\s*\[HELP_ACTION\s+"([^"]+)"\]/gm;
 
 function normalizeModelOutput(text) {
   if (!text) return '';
   return text
+    // Strip <think>...</think> blocks (Qwen 3.5 thinking mode safety net)
+    .replace(/<think>[\s\S]*?<\/think>/gi, '')
     .replace(/\r\n/g, '\n')
-    .replace(/[“”„‟]/g, '"')
-    .replace(/[‘’`]/g, "'")
+    .replace(/[\u201C\u201D\u201E\u201F\u00AB\u00BB]/g, '"')
+    .replace(/[\u2018\u2019\u201A\u201B`]/g, "'")
     .replace(/\u00A0/g, ' ')
     .replace(/[\u200B-\u200D\uFEFF]/g, '');
 }
@@ -55,9 +42,8 @@ function safeParseJson(raw) {
           if (char === '{') openBraces++;
           if (char === '}') openBraces--;
         }
-        if (char === '\\\\' && !escape) escape = true;
+        if (char === '\\' && !escape) escape = true;
         else escape = false;
-        
         if (openBraces === 0) {
           const extracted = raw.substring(start, i + 1);
           try {
@@ -72,31 +58,468 @@ function safeParseJson(raw) {
   }
 }
 
-function createParserHint(intent, observed, suggested, explanation) {
-  return {
-    kind: "parser_hint",
-    intent,
-    observed: observed.trim(),
-    suggested,
-    explanation,
-    expires_in_cycles: 1
-  };
+function extractFollowingContent(afterText) {
+  afterText = afterText.trim();
+  if (afterText.startsWith('{')) {
+    let openBraces = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = 0; i < afterText.length; i++) {
+      const char = afterText[i];
+      if (!escape && char === '"') inString = !inString;
+      if (!inString) {
+        if (char === '{') openBraces++;
+        if (char === '}') openBraces--;
+      }
+      if (char === '\\' && !escape) escape = true;
+      else escape = false;
+      if (openBraces === 0) {
+        return afterText.substring(0, i + 1);
+      }
+    }
+  }
+
+  if (afterText.startsWith('"')) {
+    let escape = false;
+    for (let i = 1; i < afterText.length; i++) {
+      const char = afterText[i];
+      if (char === '"' && !escape) {
+        return afterText.substring(0, i + 1);
+      }
+      if (char === '\\' && !escape) escape = true;
+      else escape = false;
+    }
+  }
+
+  const upToDotMatch = afterText.match(/^([^.\[\n]*)/);
+  return upToDotMatch ? upToDotMatch[1] : '';
 }
 
-function extractProse(raw) {
-  let prose = raw.trim().replace(/^[–-]\s*/, '').trim();
-  const quoteMatch = prose.match(/^"([\s\S]+)"$/);
-  if (quoteMatch) return quoteMatch[1].trim();
-  return prose;
+function cleanProseText(t) {
+  let cleaned = t.trim();
+  // Remove leading/trailing quotes
+  cleaned = cleaned.replace(/^["']|["']$/g, '').trim();
+  // Remove leading dashes/colons/tags
+  cleaned = cleaned.replace(/^[–\-:\s]+/, '').trim();
+  return cleaned;
 }
 
-/**
- * Парсер вывода агента (С мягким парсингом).
- */
+const SUGGESTED = {
+  MEM_SAVE: '[MEM_SAVE short] {"type":"thought","content":"...","priority":"normal","why":"..."}',
+  MEM_SAVE_LONG: '[MEM_SAVE long] {"type":"insight","content":"...","tags":["topic"],"why":"..."}',
+  MEM_DELETE: '[MEM_DELETE short #ID]',
+  MEM_FOCUS: '[MEM_FOCUS #ID1 #ID2]',
+  MEM_FOCUS_TOPIC: '[MEM_FOCUS] {"topic":"...","limit":3}',
+  MEM_ADAPT: '[MEM_ADAPT] {"type":"suppress","target":"...","rule":"...","why":"..."}',
+  MEM_ADAPT_CHALLENGE: '[MEM_ADAPT_CHALLENGE] {"id":"...","why":"...","replacement":"..."}',
+  MEM_ADAPT_WEAKEN: '[MEM_ADAPT_WEAKEN] {"id":"...","why":"...","amount":0.2}',
+  SCHEDULE: '[SCHEDULE 60]',
+  REFLECT: '[REFLECT]',
+  SEND_MESSAGE: '[SEND_MESSAGE] {"text":"...","why":"..."}',
+};
+
+// ========== HALLUCINATION PATTERNS TABLE ==========
+// Each entry: { re, group, intent, autofix, extract }
+//   re      — regex to detect the hallucinated pattern (run on `normalized`)
+//   group   — label for telemetry
+//   intent  — canonical tag name (key in SUGGESTED)
+//   autofix — if true and extract() returns non-null → execute the action silently
+//   extract — fn(match, normalized) → { kind, payload } or null
+//             payload shapes per intent:
+//               MEM_SAVE  → { kind:'short'|'long', entry:{type,content,priority,why} }
+//               MEM_FOCUS → { ids:[], topics:[] }
+//               SCHEDULE  → { sec: Number }
+//               REFLECT   → {}
+//               SEND_MESSAGE → { text: String }
+const HALLUCINATION_PATTERNS = [
+
+  // ── GROUP A: pseudo-wrappers [ACTION] / [TOOL] / [COMMAND] etc. ────────────
+  {
+    re: /\[(ACTION|TOOL|COMMAND|USE|INVOKE|CALL|TAG|EXECUTE|RUN|DO|APPLY)\]\s*:?\s*(MEM_SAVE|MEM_FOCUS|MEM_DELETE|SCHEDULE|REFLECT|SEND_MESSAGE|MEM_ADAPT)\b([^\n\[]*)/gi,
+    group: 'A_pseudo_wrapper',
+    // intent determined dynamically from capture group
+    autofix: true,
+    extract(match) {
+      const tagName = match[2].toUpperCase();
+      const rest    = (match[3] || '').trim();
+      if (tagName === 'REFLECT') return { kind: 'REFLECT' };
+      if (tagName === 'SCHEDULE') {
+        const n = parseInt((rest.match(/\d+/) || [])[0], 10);
+        if (n > 0) return { kind: 'SCHEDULE', sec: n };
+        return null; // no number → hint
+      }
+      if (tagName === 'MEM_FOCUS') {
+        const ids = [...rest.matchAll(/#?([SL]?\d+)\b/gi)].map(m => m[1].toUpperCase()
+          .replace(/^(\d+)$/, 'S$1'));
+        if (ids.length > 0) return { kind: 'MEM_FOCUS', ids };
+        const topic = rest.replace(/#/g,'').trim();
+        if (topic.length > 2) return { kind: 'MEM_FOCUS_TOPIC', topic };
+        return null;
+      }
+      if (tagName === 'MEM_SAVE') {
+        // try JSON first
+        const jStart = rest.indexOf('{');
+        if (jStart >= 0) {
+          const p = safeParseJson(rest.substring(jStart));
+          if (p.ok && p.value.content) return { kind: 'MEM_SAVE', memKind: 'short', entry: p.value };
+        }
+        const clean = cleanProseText(rest);
+        if (clean.length > 5) return { kind: 'MEM_SAVE', memKind: 'short', entry: { type:'thought', content: clean, priority:'normal', why:'Auto-repaired from pseudo-wrapper.' } };
+        return null;
+      }
+      if (tagName === 'SEND_MESSAGE') {
+        const txt = cleanProseText(rest);
+        if (txt.length > 2) return { kind: 'SEND_MESSAGE', text: txt };
+        return null;
+      }
+      return null;
+    },
+    intentFor: (match) => match[2].toUpperCase()
+  },
+
+  // ── Dialect Entry 1: **Action:** MESSAGE "..." / SEND "..." / SEND_MESSAGE "..."
+  {
+    re: /\*\*Action:\*\*\s+(MESSAGE|SEND|SEND_MESSAGE)\s+["']([^"']+)["']/gi,
+    group: 'A_pseudo_wrapper',
+    autofix: true,
+    extract(match) {
+      const text = match[2].trim();
+      if (text.length > 0) return { kind: 'SEND_MESSAGE', text };
+      return null;
+    },
+    intentFor: () => 'SEND_MESSAGE'
+  },
+
+  // ── Dialect Entry 2: **Action:** MEM_SAVE {...}
+  {
+    re: /\*\*Action:\*\*\s+MEM_SAVE\b([^\n]*)/gi,
+    group: 'A_pseudo_wrapper',
+    autofix: true,
+    extract(match) {
+      const rest = (match[1] || '').trim();
+      const jStart = rest.indexOf('{');
+      if (jStart >= 0) {
+        const p = safeParseJson(rest.substring(jStart));
+        if (p.ok && p.value.content) return { kind: 'MEM_SAVE', memKind: 'short', entry: p.value };
+      }
+      const clean = cleanProseText(rest);
+      if (clean.length > 5) {
+        return {
+          kind: 'MEM_SAVE',
+          memKind: 'short',
+          entry: { type: 'thought', content: clean, priority: 'normal', why: 'Auto-repaired from dialect.' }
+        };
+      }
+      return null;
+    },
+    intentFor: () => 'MEM_SAVE'
+  },
+
+  // ── Dialect Entry 3: **Action:** MEM_FOCUS #ID or topic
+  {
+    re: /\*\*Action:\*\*\s+MEM_FOCUS\s+([^\n]+)/gi,
+    group: 'A_pseudo_wrapper',
+    autofix: true,
+    extract(match) {
+      const rest = (match[1] || '').trim();
+      const ids = [...rest.matchAll(/#?([SL]?\d+)\b/gi)].map(m => m[1].toUpperCase().replace(/^(\d+)$/, 'S$1'));
+      if (ids.length > 0) return { kind: 'MEM_FOCUS', ids };
+      const topic = rest.replace(/#/g, '').replace(/[\[\]]/g, '').trim();
+      if (topic.length > 2) return { kind: 'MEM_FOCUS_TOPIC', topic };
+      return null;
+    },
+    intentFor: () => 'MEM_FOCUS'
+  },
+
+  // ── GROUP B: colon-separator  [MEM_SAVE]: {...} ─────────────────────────
+  {
+    re: /\[(MEM_SAVE|MEM_FOCUS|SCHEDULE|SEND_MESSAGE|REFLECT|MEM_ADAPT|MEM_DELETE)\s*(short|long)?\]\s*:\s*([^\n\[]{1,400})/gi,
+    group: 'B_colon_sep',
+    autofix: true,
+    extract(match) {
+      const tagName = match[1].toUpperCase();
+      const subKind = (match[2] || '').toLowerCase();
+      const rest    = (match[3] || '').trim();
+      if (tagName === 'SCHEDULE') {
+        const n = parseInt((rest.match(/\d+/) || [])[0], 10);
+        if (n > 0) return { kind: 'SCHEDULE', sec: n };
+        return null;
+      }
+      if (tagName === 'REFLECT') return { kind: 'REFLECT' };
+      if (tagName === 'MEM_FOCUS') {
+        const ids = [...rest.matchAll(/#?([SL]?\d+)\b/gi)].map(m => m[1].toUpperCase().replace(/^(\d+)$/, 'S$1'));
+        if (ids.length > 0) return { kind: 'MEM_FOCUS', ids };
+        return null;
+      }
+      if (tagName === 'MEM_SAVE') {
+        const memKind = subKind === 'long' ? 'long' : 'short';
+        const jStart = rest.indexOf('{');
+        if (jStart >= 0) {
+          const p = safeParseJson(rest.substring(jStart));
+          if (p.ok && p.value.content) return { kind: 'MEM_SAVE', memKind, entry: p.value };
+        }
+        const clean = cleanProseText(rest);
+        if (clean.length > 5) return { kind: 'MEM_SAVE', memKind, entry: { type:'thought', content: clean, priority:'normal', why:'Auto-repaired from colon-separator.' } };
+        return null;
+      }
+      if (tagName === 'SEND_MESSAGE') {
+        const txt = cleanProseText(rest);
+        if (txt.length > 2) return { kind: 'SEND_MESSAGE', text: txt };
+        return null;
+      }
+      return null;
+    },
+    intentFor: (match) => match[1].toUpperCase()
+  },
+
+  // ── GROUP C: arrow/equals wrapping  [MEM_SAVE → {...}]  MEM_SAVE -> {...} ─
+  {
+    re: /\[?(MEM_SAVE|MEM_FOCUS|SCHEDULE|SEND_MESSAGE|REFLECT)\s*(?:→|->|=>|=)\s*([^\n\]]{1,300})\]?/gi,
+    group: 'C_arrow_eq',
+    autofix: true,
+    extract(match) {
+      const tagName = match[1].toUpperCase();
+      const rest    = (match[2] || '').trim();
+      if (tagName === 'SCHEDULE') {
+        const n = parseInt((rest.match(/\d+/) || [])[0], 10);
+        if (n > 0) return { kind: 'SCHEDULE', sec: n };
+        return null;
+      }
+      if (tagName === 'REFLECT') return { kind: 'REFLECT' };
+      if (tagName === 'MEM_FOCUS') {
+        const ids = [...rest.matchAll(/#?([SL]?\d+)\b/gi)].map(m => m[1].toUpperCase().replace(/^(\d+)$/, 'S$1'));
+        if (ids.length > 0) return { kind: 'MEM_FOCUS', ids };
+        return null;
+      }
+      if (tagName === 'MEM_SAVE') {
+        const jStart = rest.indexOf('{');
+        if (jStart >= 0) {
+          const p = safeParseJson(rest.substring(jStart));
+          if (p.ok && p.value.content) return { kind: 'MEM_SAVE', memKind:'short', entry: p.value };
+        }
+        const clean = cleanProseText(rest);
+        if (clean.length > 5) return { kind: 'MEM_SAVE', memKind:'short', entry:{ type:'thought', content:clean, priority:'normal', why:'Auto-repaired from arrow/eq.' } };
+        return null;
+      }
+      if (tagName === 'SEND_MESSAGE') {
+        const txt = cleanProseText(rest);
+        if (txt.length > 2) return { kind: 'SEND_MESSAGE', text: txt };
+        return null;
+      }
+      return null;
+    },
+    intentFor: (match) => match[1].toUpperCase()
+  },
+
+  // ── GROUP D: empty tag then content on next line ─────────────────────────
+  {
+    re: /\[(MEM_SAVE|MEM_FOCUS|SCHEDULE|SEND_MESSAGE|REFLECT|MEM_ADAPT)\]\s*\n([^\n\[]{1,300})/gi,
+    group: 'D_next_line',
+    autofix: true,
+    extract(match) {
+      const tagName = match[1].toUpperCase();
+      const rest    = (match[2] || '').trim();
+      if (tagName === 'SCHEDULE') {
+        const n = parseInt((rest.match(/\d+/) || [])[0], 10);
+        if (n > 0) return { kind: 'SCHEDULE', sec: n };
+        return null;
+      }
+      if (tagName === 'REFLECT') return { kind: 'REFLECT' };
+      if (tagName === 'MEM_FOCUS') {
+        const ids = [...rest.matchAll(/#?([SL]?\d+)\b/gi)].map(m => m[1].toUpperCase().replace(/^(\d+)$/, 'S$1'));
+        if (ids.length > 0) return { kind: 'MEM_FOCUS', ids };
+        return null;
+      }
+      if (tagName === 'MEM_SAVE') {
+        const jStart = rest.indexOf('{');
+        if (jStart >= 0) {
+          const p = safeParseJson(rest.substring(jStart));
+          if (p.ok && p.value.content) return { kind: 'MEM_SAVE', memKind:'short', entry: p.value };
+        }
+        return null; // ambiguous next-line prose → hint
+      }
+      if (tagName === 'SEND_MESSAGE') {
+        const txt = cleanProseText(rest);
+        if (txt.length > 2) return { kind: 'SEND_MESSAGE', text: txt };
+        return null;
+      }
+      return null;
+    },
+    intentFor: (match) => match[1].toUpperCase()
+  },
+
+  // ── GROUP E: markdown wrappers  `[TAG] ...`  **[TAG]** ...  > [TAG] ... ──
+  {
+    re: /(?:`+|\*{1,2}|>\s*)\[?(MEM_SAVE|MEM_FOCUS|SCHEDULE|SEND_MESSAGE|REFLECT|MEM_ADAPT|MEM_DELETE)\s*(short|long)?\]?(?:`*|\*{0,2})\s*([^`\n\[\]]{0,300})/gi,
+    group: 'E_markdown',
+    autofix: true,
+    extract(match) {
+      const tagName = match[1].toUpperCase();
+      const subKind = (match[2] || '').toLowerCase();
+      const rest    = (match[3] || '').trim();
+      if (tagName === 'SCHEDULE') {
+        const n = parseInt((rest.match(/\d+/) || [])[0], 10);
+        if (n > 0) return { kind: 'SCHEDULE', sec: n };
+        return null;
+      }
+      if (tagName === 'REFLECT') return { kind: 'REFLECT' };
+      if (tagName === 'MEM_FOCUS') {
+        const ids = [...rest.matchAll(/#?([SL]?\d+)\b/gi)].map(m => m[1].toUpperCase().replace(/^(\d+)$/, 'S$1'));
+        if (ids.length > 0) return { kind: 'MEM_FOCUS', ids };
+        return null;
+      }
+      if (tagName === 'MEM_SAVE') {
+        const memKind = subKind === 'long' ? 'long' : 'short';
+        const jStart = rest.indexOf('{');
+        if (jStart >= 0) {
+          const p = safeParseJson(rest.substring(jStart));
+          if (p.ok && p.value.content) return { kind: 'MEM_SAVE', memKind, entry: p.value };
+        }
+        return null;
+      }
+      if (tagName === 'SEND_MESSAGE') {
+        const txt = cleanProseText(rest);
+        if (txt.length > 2) return { kind: 'SEND_MESSAGE', text: txt };
+        return null;
+      }
+      return null;
+    },
+    intentFor: (match) => match[1].toUpperCase()
+  },
+
+  // ── GROUP F: unknown/synonym wrappers → always hint ─────────────────────
+  { re: /\[(MEMORY_SAVE|SAVE_MEMORY|REMEMBER|NOTE|STORE|MEMORIZE)\b[^\]]*\]/gi, group:'F_synonym', autofix:false, intentFor:() => 'MEM_SAVE' },
+  { re: /\[(SEND|MESSAGE|MSG|NOTIFY|REPLY)\b[^\]]*\]/gi,                        group:'F_synonym', autofix:false, intentFor:() => 'SEND_MESSAGE' },
+  { re: /\[(WAIT|SLEEP|DELAY|PAUSE|TIMER)\b[^\]]*\]/gi,                         group:'F_synonym', autofix:false, intentFor:() => 'SCHEDULE' },
+  { re: /\[(THINK_ABOUT|MEDITATE|SUMMARIZE|COMPRESS|ARCHIVE)\b[^\]]*\]/gi,      group:'F_synonym', autofix:false, intentFor:() => 'REFLECT' },
+  { re: /\[(ADAPT|BEHAVIOR|HABIT|SELF_MODIFY)\b[^\]]*\]/gi,                     group:'F_synonym', autofix:false, intentFor:() => 'MEM_ADAPT' },
+  { re: /\[(FOCUS)\s+([^\]]+)\]/gi, group:'F_synonym', autofix:true,
+    extract(match) {
+      const rest = (match[2] || '').trim();
+      const ids = [...rest.matchAll(/#?([SL]?\d+)\b/gi)].map(m => m[1].toUpperCase().replace(/^(\d+)$/, 'S$1'));
+      if (ids.length > 0) return { kind: 'MEM_FOCUS', ids };
+      const topic = cleanProseText(rest);
+      if (topic.length > 2) return { kind: 'MEM_FOCUS_TOPIC', topic };
+      return null;
+    },
+    intentFor: () => 'MEM_FOCUS'
+  },
+  { re: /\[(DELETE|FORGET|REMOVE)\s+[^\]]+\]/gi,  group:'F_synonym', autofix:false, intentFor:() => 'MEM_DELETE' },
+];
+
+// ── Helper: apply one resolved extraction to actions ─────────────────────────
+function _applyExtraction(resolved, actions, addToolHint, logTelemetry, SUGGESTED, patternGroup, rawMatch) {
+  const { kind } = resolved;
+  if (kind === 'REFLECT') {
+    if (!actions.reflect) {
+      actions.reflect = true;
+      actions.feedback.executed.push({ intent:'REFLECT', summary:`[parser: understood as REFLECT]` });
+      logTelemetry('parser.hallucination_repaired', { group: patternGroup, kind, raw: rawMatch.slice(0,60) });
+    }
+    return true;
+  }
+  if (kind === 'SCHEDULE') {
+    actions.scheduleSec = resolved.sec;
+    actions.scheduleSecParsed = true;
+    actions.feedback.executed.push({ intent:'SCHEDULE', summary:`[parser: understood as SCHEDULE ${resolved.sec}s]` });
+    logTelemetry('parser.hallucination_repaired', { group: patternGroup, kind, sec: resolved.sec, raw: rawMatch.slice(0,60) });
+    return true;
+  }
+  if (kind === 'MEM_FOCUS') {
+    for (const id of resolved.ids) {
+      if (!actions.focusIds.includes(id)) actions.focusIds.push(id);
+    }
+    actions.feedback.executed.push({ intent:'MEM_FOCUS', summary:`[parser: understood as MEM_FOCUS ${resolved.ids.join(',')}]` });
+    logTelemetry('parser.hallucination_repaired', { group: patternGroup, kind, ids: resolved.ids, raw: rawMatch.slice(0,60) });
+    return true;
+  }
+  if (kind === 'MEM_FOCUS_TOPIC') {
+    if (!actions.focusTopics.some(t => t.topic.toLowerCase() === resolved.topic.toLowerCase())) {
+      actions.focusTopics.push({ topic: resolved.topic, limit: 3 });
+    }
+    actions.feedback.executed.push({ intent:'MEM_FOCUS', summary:`[parser: understood as MEM_FOCUS topic "${resolved.topic}"]` });
+    logTelemetry('parser.hallucination_repaired', { group: patternGroup, kind:'MEM_FOCUS_TOPIC', topic: resolved.topic, raw: rawMatch.slice(0,60) });
+    return true;
+  }
+  if (kind === 'MEM_SAVE') {
+    const entry = resolved.entry || {};
+    if (!entry.type) entry.type = 'thought';
+    if (!entry.why) entry.why = 'Auto-repaired from dialect ('+patternGroup+')';
+    if (Array.isArray(entry.tags)) entry.tags = entry.tags.join(', ');
+    actions.saves.push({ kind: resolved.memKind || 'short', entry });
+    actions.feedback.executed.push({ intent:'MEM_SAVE', summary:`[parser: understood as MEM_SAVE ${resolved.memKind||'short'}]` });
+    logTelemetry('parser.hallucination_repaired', { group: patternGroup, kind:'MEM_SAVE', memKind: resolved.memKind, raw: rawMatch.slice(0,60) });
+    return true;
+  }
+  if (kind === 'SEND_MESSAGE') {
+    actions.messages.push(resolved.text);
+    actions.feedback.executed.push({ intent:'SEND_MESSAGE', summary:`[parser: understood as SEND_MESSAGE]` });
+    logTelemetry('parser.hallucination_repaired', { group: patternGroup, kind:'SEND_MESSAGE', raw: rawMatch.slice(0,60) });
+    return true;
+  }
+  return false;
+}
+
+// ── Main hallucination-scan function (runs on `normalized`, AFTER main pass) ─
+function processHallucinationPatterns(normalized, actions, addToolHint, logTelemetry, SUGGESTED) {
+  const MAX_HALLUCINATIONS_PER_CYCLE = 3;
+  let caught = 0;
+
+  // collect already-covered ranges from commandRanges to avoid double-firing
+  // (we cannot reach commandRanges here, so we use a local set of raw matches)
+  const alreadyCovered = new Set();
+
+  for (const pat of HALLUCINATION_PATTERNS) {
+    if (caught >= MAX_HALLUCINATIONS_PER_CYCLE) break;
+    pat.re.lastIndex = 0;
+    let m;
+    while ((m = pat.re.exec(normalized)) !== null) {
+      if (caught >= MAX_HALLUCINATIONS_PER_CYCLE) break;
+      const rawMatch = m[0];
+      // Skip if this exact span was already processed by another pattern
+      const spanKey = `${m.index}:${m.index + rawMatch.length}`;
+      if (alreadyCovered.has(spanKey)) continue;
+      alreadyCovered.add(spanKey);
+
+      const intent = pat.intentFor(m);
+      const sugKey = {
+        'MEM_SAVE': 'MEM_SAVE', 'MEM_FOCUS': 'MEM_FOCUS', 'MEM_DELETE': 'MEM_DELETE',
+        'SCHEDULE': 'SCHEDULE', 'REFLECT': 'REFLECT', 'SEND_MESSAGE': 'SEND_MESSAGE',
+        'MEM_ADAPT': 'MEM_ADAPT', 'MEM_ADAPT_CHALLENGE': 'MEM_ADAPT_CHALLENGE'
+      }[intent] || 'MEM_SAVE';
+      const suggested = SUGGESTED[sugKey] || `[${intent}]`;
+
+      let repaired = false;
+      if (pat.autofix && typeof pat.extract === 'function') {
+        try {
+          const resolved = pat.extract(m);
+          if (resolved) {
+            repaired = _applyExtraction(resolved, actions, addToolHint, logTelemetry, SUGGESTED, pat.group, rawMatch);
+            if (repaired) {
+              actions.repairedCount = (actions.repairedCount || 0) + 1;
+            }
+          }
+        } catch (err) {
+          // extraction error → fall through to hint
+          logTelemetry('parser.hallucination_extract_error', { group: pat.group, err: err.message });
+        }
+      }
+
+      if (!repaired) {
+        // Inject a one-time, precise instruction for the next cycle
+        const explanation = `Your tag looked like \"${rawMatch.slice(0,60).replace(/\n/g,' ')}\" but the parser could not execute it.`
+          + ` Use the exact syntax:\n  ${suggested}`;
+        addToolHint(intent, rawMatch.slice(0,60), suggested, explanation);
+        logTelemetry('parser.hallucination_hint', { group: pat.group, intent, raw: rawMatch.slice(0,60) });
+      }
+
+      caught++;
+    }
+  }
+}
+
 function parseOutput(text) {
   const normalizedFull = normalizeModelOutput(text);
-  const lines = normalizedFull.split('\n');
-  
   const normalized = normalizedFull;
 
   const actions = {
@@ -113,336 +536,368 @@ function parseOutput(text) {
     scheduleSec: config.defaultIntervalSec,
     reflect: false,
     parseErrorCount: 0,
-    parserHints: []
+    repairedCount: 0,
+    scheduleSecParsed: false,
+    feedback: {
+      executed: [],
+      failed: [],
+      hints: []
+    }
   };
 
-  const clearText = lines
-    .filter(line => !/^\s*\[(MEM_SAVE|MEM_DELETE|MEM_FOCUS|MEM_ADAPT|MEM_ADAPT_CHALLENGE|MEM_ADAPT_WEAKEN|SCHEDULE|REFLECT|SEND_MESSAGE|HELP_ACTIONS|HELP_ACTION)\b/.test(line))
-    .join('\n')
-    .trim();
-
-  // Non-interference mode detection
-  const isReflectTag = /^\s*\[REFLECT\]/m.test(normalized);
-  const isDeepReflection = clearText.length > 500 || isReflectTag;
-
-  let match;
-  
   const addHelp = (tag) => {
     if (!actions.helpRequests.includes(tag)) actions.helpRequests.push(tag);
   };
-  
-  const addHint = (intent, obs, sug, expl, isMinor = false) => {
-    if (isDeepReflection && isMinor) return; // Non-interference mode
-    if (actions.parserHints.length < 2 && !actions.parserHints.some(h => h.intent === intent)) {
-      actions.parserHints.push(createParserHint(intent, obs, sug, expl));
-    }
+
+  const addFailed = (intent, observed, reason, suggested) => {
+    actions.feedback.failed.push({ intent, observed: observed.trim(), reason, suggested });
+    logTelemetry('parser.malformed_intent', { intent, observed: observed.trim().slice(0, 60), reason });
   };
 
-  // MEM_SAVE
-  RE_MEM_SAVE.lastIndex = 0;
-  while ((match = RE_MEM_SAVE.exec(normalized)) !== null) {
-    const kind = match[1];
-    const rawJson = match[2].trim();
-    const parsed = safeParseJson(rawJson);
-    const observedTag = `[MEM_SAVE${kind ? ' ' + kind : ''}]` + (rawJson ? ` - ${rawJson.slice(0, 30)}...` : '');
-    
-    if (parsed.ok) {
-      const obj = parsed.value;
-      if (!obj.type || !obj.content) {
-        // Missing fields? Soft parse it as content
-        actions.saves.push({ kind: kind || 'short', entry: { type: 'thought', content: JSON.stringify(obj), priority: 'normal', why: "Soft parsed incomplete JSON." } });
-        addHint('MEM_SAVE', observedTag, `[MEM_SAVE short] {"type":"thought","content":"...","priority":"normal","why":"..."}`, "Action successful. Missing fields filled automatically.", true);
-      } else {
-        if (Array.isArray(obj.tags)) {
-          obj.tags = obj.tags.join(', ');
-        } else if (typeof obj.tags === 'string') {
-          obj.tags = obj.tags.split(',').map(s => s.trim()).join(', ');
-        }
-        if (!obj.why) {
-          obj.why = "Agent expressed stable save intent.";
-        }
-        actions.saves.push({ kind: kind || 'short', entry: obj });
+  const addToolHint = (intent, observed, suggested, explanation) => {
+    actions.feedback.hints.push({ intent, observed: observed.trim(), suggested, explanation });
+    logTelemetry('parser.hint_created', { intent });
+  };
+
+  const commandRanges = [];
+  const RE_ANY_TAG = /\[(MEM_SAVE|MEM_DELETE|MEM_FOCUS|MEM_ADAPT_CHALLENGE|MEM_ADAPT_WEAKEN|MEM_ADAPT|SCHEDULE|REFLECT|SEND_MESSAGE|HELP_ACTION|HELP_ACTIONS)\b([^\]]*)\]/gi;
+
+  let match;
+  while ((match = RE_ANY_TAG.exec(normalized)) !== null) {
+    const startIdx = match.index;
+    const tagLen = match[0].length;
+    const closingBracketIndex = startIdx + tagLen;
+
+    const intent = match[1].toUpperCase();
+    const bracketParams = match[2] ? match[2].trim() : '';
+
+    const afterTextRaw = normalized.substring(closingBracketIndex);
+    const proseFollowing = extractFollowingContent(afterTextRaw).trim();
+
+    // Guard: indexOf returns -1 if proseFollowing is empty string or not found
+    const proseOffset = proseFollowing.length > 0 ? afterTextRaw.indexOf(proseFollowing) : 0;
+    const endIdx = closingBracketIndex + Math.max(proseOffset, 0) + proseFollowing.length;
+    commandRanges.push({ start: startIdx, end: endIdx });
+
+    const combinedArgs = (bracketParams + " " + proseFollowing).trim();
+    const observed = `${match[0]} ${proseFollowing.slice(0, 50)}`;
+
+    if (intent === 'MEM_SAVE') {
+      const kind = (bracketParams.includes('long') || proseFollowing.includes('long')) ? 'long' : 'short';
+      
+      let parsed = { ok: false };
+      const startBrace = combinedArgs.indexOf('{');
+      if (startBrace >= 0) {
+        parsed = safeParseJson(combinedArgs.substring(startBrace));
       }
-    } else {
-      const prose = extractProse(rawJson);
-      if (prose.length > 0 && !prose.startsWith('{')) {
-        if (rawJson.match(/^#\d+/)) {
-          const ids = [...rawJson.matchAll(/\d+/g)].map(m => Number.parseInt(m[0], 10));
-          actions.focusIds.push(...ids);
-          addHint('MEM_FOCUS', observedTag, `[MEM_FOCUS ${ids.map(id => '#' + id).join(' ')}]`, "Action successful. Use MEM_FOCUS to bring existing records into context instead of MEM_SAVE.", true);
+
+      const hasIdMistake = /#\d+/.test(combinedArgs) && !parsed.ok;
+      
+      if (hasIdMistake) {
+        const idNum = (combinedArgs.match(/#(\d+)/) || [])[1];
+        addFailed(
+          'MEM_SAVE',
+          observed,
+          'id_not_valid_for_save',
+          `[MEM_SAVE #ID] is not valid syntax.\nTo SAVE new data use: ${SUGGESTED.MEM_SAVE}\nTo FOCUS existing record: [MEM_FOCUS #${idNum}]`
+        );
+        addHelp('MEM_SAVE');
+      } else if (parsed.ok) {
+        const obj = parsed.value;
+        if (!obj.type || !obj.content) {
+          addFailed('MEM_SAVE', observed, 'missing_required_fields', SUGGESTED.MEM_SAVE);
+          addHelp('MEM_SAVE');
+          actions.parseErrorCount++;
         } else {
-          actions.saves.push({ kind: kind || 'short', entry: { type: 'thought', content: prose, priority: 'normal', why: "Agent expressed intent via prose." } });
-          addHint('MEM_SAVE', observedTag, `[MEM_SAVE short] {"type":"thought","content":"...","priority":"normal","why":"..."}`, "Action successful. To add specific tags or priority, use the JSON format.", true);
+          if (Array.isArray(obj.tags)) {
+            obj.tags = obj.tags.join(', ');
+          } else if (typeof obj.tags === 'string') {
+            obj.tags = obj.tags.split(',').map(s => s.trim()).join(', ');
+          }
+          if (!obj.why) {
+            obj.why = "Agent expressed stable save intent.";
+          }
+          actions.saves.push({ kind, entry: obj });
+          logTelemetry('parser.valid_action', { intent: 'MEM_SAVE', kind });
         }
-      } else if (prose.length > 0) {
-        // Graceful fallback for broken JSON
-        const raw = extractProse(rawJson);
-        actions.saves.push({ kind: kind || 'short', entry: { type: 'thought', content: raw, priority: 'normal', why: "Saved as raw text due to JSON error." } });
-        addHint('MEM_SAVE', observedTag, `[MEM_SAVE short] {"type":"thought","content":"..."}`, "JSON error (e.g. unescaped quotes). Text saved as raw string to prevent data loss.", false);
       } else {
-        addHint('MEM_SAVE', `[MEM_SAVE]`, `[MEM_SAVE short] {"type":"thought","content":"..."}`, "Empty save tag detected.", false);
-      }
-    }
-  }
-
-  // MEM_DELETE
-  RE_MEM_DEL.lastIndex = 0;
-  while ((match = RE_MEM_DEL.exec(normalized)) !== null) {
-    const insideArgs = match[1];
-    const trailingArgs = match[2];
-    let kind = undefined;
-    if (insideArgs.includes('short')) kind = 'short';
-    if (insideArgs.includes('long')) kind = 'long';
-    
-    const combined = insideArgs + " " + trailingArgs;
-    // Smart extraction: find any digits
-    const ids = [...combined.matchAll(/\d+/g)].map(m => Number.parseInt(m[0], 10));
-    const observedTag = `[MEM_DELETE${insideArgs}]` + (trailingArgs ? ` ${trailingArgs.slice(0, 30)}` : '');
-    
-    if (ids.length > 0) {
-      for (const id of ids) {
-        if (Number.isFinite(id)) {
-          actions.deletes.push({ kind, id });
+        const cleanedContent = cleanProseText(combinedArgs.replace(/\b(short|long)\b/gi, ''));
+        if (cleanedContent.length > 0) {
+          const obj = {
+            type: kind === 'long' ? 'insight' : 'thought',
+            content: cleanedContent,
+            priority: 'normal',
+            why: 'Automatically parsed from prose/inline tag.'
+          };
+          actions.saves.push({ kind, entry: obj });
+          logTelemetry('parser.valid_action', { intent: 'MEM_SAVE', kind, autoWrapped: true });
+        } else {
+          addFailed('MEM_SAVE', observed, 'empty_tag', SUGGESTED.MEM_SAVE);
+          addHelp('MEM_SAVE');
         }
       }
-    } else {
-      addHint('MEM_DELETE', observedTag, `[MEM_DELETE short #ID]`, "You used MEM_DELETE without a valid ID. Specify the ID with a hash, e.g., #61.", false);
-      addHelp('MEM_DELETE');
     }
-  }
 
-  // MEM_FOCUS
-  RE_MEM_FOCUS.lastIndex = 0;
-  while ((match = RE_MEM_FOCUS.exec(normalized)) !== null) {
-    const rawIds = match[1];
-    const rawJson = match[2].trim();
-    const observedTag = `[MEM_FOCUS${rawIds}]` + (rawJson ? ` ${rawJson.slice(0, 30)}...` : '');
-    
-    let acted = false;
-    if (rawIds) {
-      // Smart extraction
-      const ids = [...rawIds.matchAll(/\d+/g)].map(m => Number.parseInt(m[0], 10));
-      if (ids.length > 0) {
-        actions.focusIds.push(...ids);
-        acted = true;
+    else if (intent === 'MEM_DELETE') {
+      const parsedIds = [...combinedArgs.matchAll(/#?([SL]?\d+)\b/gi)].map(m => {
+        const raw = m[1].toUpperCase();
+        const itemKind = raw.startsWith('L') ? 'long' : (raw.startsWith('S') ? 'short' : undefined);
+        const itemId = Number.parseInt(raw.replace(/[SL]/g, ''), 10);
+        return { kind: itemKind, id: itemId };
+      });
+      const kind = combinedArgs.includes('long') ? 'long' : (combinedArgs.includes('short') ? 'short' : undefined);
+      if (parsedIds.length > 0) {
+        for (const item of parsedIds) {
+          actions.deletes.push({ kind: item.kind || kind, id: item.id });
+          logTelemetry('parser.valid_action', { intent: 'MEM_DELETE', id: item.id });
+        }
+      } else {
+        addFailed('MEM_DELETE', observed, 'no_valid_id', SUGGESTED.MEM_DELETE);
+        addHelp('MEM_DELETE');
       }
     }
-    
-    if (rawJson) {
-      const parsed = safeParseJson(rawJson);
+
+    else if (intent === 'MEM_FOCUS') {
+      let acted = false;
+      
+      let parsed = { ok: false };
+      const startBrace = combinedArgs.indexOf('{');
+      if (startBrace >= 0) {
+        parsed = safeParseJson(combinedArgs.substring(startBrace));
+      }
+
       if (parsed.ok && parsed.value.topic) {
         actions.focusTopics.push({ topic: parsed.value.topic, limit: parsed.value.limit || 3 });
         acted = true;
+        logTelemetry('parser.valid_action', { intent: 'MEM_FOCUS', topic: parsed.value.topic });
       } else {
-        const prose = extractProse(rawJson);
-        if (prose.length > 3 && !prose.startsWith('{')) {
-           actions.focusTopics.push({ topic: prose, limit: 3 });
-           addHint('MEM_FOCUS', observedTag, `[MEM_FOCUS] {"topic":"${prose}","limit":3}`, "Action successful. You used prose instead of JSON.", true);
-           acted = true;
-        } else if (prose.startsWith('{')) {
-          // Graceful fallback
-          const raw = extractProse(rawJson);
-          actions.focusTopics.push({ topic: raw, limit: 3 });
-          addHint('MEM_FOCUS', observedTag, `[MEM_FOCUS] {"topic":"keyword"}`, "JSON error. Focus was approximated.", false);
+        const parsedIds = [...combinedArgs.matchAll(/#?([SL]?\d+)\b/gi)].map(m => m[1].toUpperCase());
+        if (parsedIds.length > 0) {
+          const formattedIds = parsedIds.map(raw => {
+            if (/^\d+$/.test(raw)) return 'S' + raw;
+            return raw;
+          });
+          actions.focusIds.push(...formattedIds);
           acted = true;
+          logTelemetry('parser.valid_action', { intent: 'MEM_FOCUS', ids: formattedIds });
+        } else {
+          const cleanedTopic = cleanProseText(combinedArgs);
+          if (cleanedTopic.length > 0) {
+            actions.focusTopics.push({ topic: cleanedTopic, limit: 3 });
+            acted = true;
+            logTelemetry('parser.valid_action', { intent: 'MEM_FOCUS', topic: cleanedTopic, autoTopic: true });
+            addToolHint('MEM_FOCUS', observed, SUGGESTED.MEM_FOCUS,
+              `Focused on topic "${cleanedTopic}". If you meant to focus on specific memory record IDs, use: [MEM_FOCUS #ID]`);
+          }
         }
       }
-    }
-    
-    if (!acted && !rawJson && !rawIds) {
-       addHint('MEM_FOCUS', observedTag, `[MEM_FOCUS #ID]`, "Empty MEM_FOCUS tag. Use IDs or a topic JSON.", false);
-       addHelp('MEM_FOCUS');
-    }
-  }
 
-  // MEM_ADAPT
-  RE_MEM_ADAPT.lastIndex = 0;
-  while ((match = RE_MEM_ADAPT.exec(normalized)) !== null) {
-    const rawJson = match[1].trim();
-    const parsed = safeParseJson(rawJson);
-    const observedTag = `[MEM_ADAPT] ${rawJson.slice(0, 30)}`;
-    if (parsed.ok && parsed.value.type && parsed.value.target && parsed.value.rule) {
-      actions.adapts.push(parsed.value);
-    } else {
-      const prose = extractProse(rawJson);
-      if (prose.length > 0 && !prose.startsWith('{')) {
-         actions.adapts.push({ type: "strengthen", target: "self", rule: prose, why: "Soft parsed from prose." });
-         addHint('MEM_ADAPT', observedTag, `[MEM_ADAPT] {"type":"strengthen","target":"...","rule":"...","why":"..."}`, "Action successful. For strict control over adaptations, use JSON.", true);
-      } else if (prose.length > 0) {
-         actions.adapts.push({ type: "strengthen", target: "self", rule: prose, why: "Fallback from broken JSON." });
-         addHint('MEM_ADAPT', observedTag, `[MEM_ADAPT] {"type":"strengthen","target":"...","rule":"...","why":"..."}`, "JSON error. Saved adaptation as a general rule.", false);
-      } else {
-         addHint('MEM_ADAPT', observedTag, `[MEM_ADAPT] {"type":"strengthen","target":"...","rule":"...","why":"..."}`, "Empty MEM_ADAPT tag.", false);
+      if (!acted) {
+        addFailed('MEM_FOCUS', observed, 'empty_tag', SUGGESTED.MEM_FOCUS);
+        addHelp('MEM_FOCUS');
       }
     }
-  }
 
-  // MEM_ADAPT_CHALLENGE
-  RE_MEM_ADAPT_CHALLENGE.lastIndex = 0;
-  while ((match = RE_MEM_ADAPT_CHALLENGE.exec(normalized)) !== null) {
-    const rawJson = match[1].trim();
-    const parsed = safeParseJson(rawJson);
-    const observedTag = `[MEM_ADAPT_CHALLENGE] ${rawJson.slice(0, 30)}`;
-    if (parsed.ok && parsed.value.id) {
-      actions.adaptChallenges.push(parsed.value);
-    } else {
-      addHint('MEM_ADAPT_CHALLENGE', observedTag, `[MEM_ADAPT_CHALLENGE] {"id":"...","why":"...","replacement":"..."}`, "Malformed challenge intent.", false);
-      addHelp('MEM_ADAPT_CHALLENGE');
+    else if (intent === 'MEM_ADAPT') {
+      const parsed = safeParseJson(combinedArgs);
+      if (parsed.ok && parsed.value.type && parsed.value.target && parsed.value.rule) {
+        actions.adapts.push(parsed.value);
+        logTelemetry('parser.valid_action', { intent: 'MEM_ADAPT' });
+      } else {
+        addFailed('MEM_ADAPT', observed, 'malformed_tag', SUGGESTED.MEM_ADAPT);
+        addHelp('MEM_ADAPT');
+      }
     }
-  }
 
-  // MEM_ADAPT_WEAKEN
-  RE_MEM_ADAPT_WEAKEN.lastIndex = 0;
-  while ((match = RE_MEM_ADAPT_WEAKEN.exec(normalized)) !== null) {
-    const rawJson = match[1].trim();
-    const parsed = safeParseJson(rawJson);
-    const observedTag = `[MEM_ADAPT_WEAKEN] ${rawJson.slice(0, 30)}`;
-    if (parsed.ok && parsed.value.id && typeof parsed.value.amount === 'number') {
-      actions.adaptWeakens.push(parsed.value);
-    } else {
-      addHint('MEM_ADAPT_WEAKEN', observedTag, `[MEM_ADAPT_WEAKEN] {"id":"...","why":"...","amount":0.2}`, "Malformed weaken intent.", false);
-      addHelp('MEM_ADAPT_WEAKEN');
+    else if (intent === 'MEM_ADAPT_CHALLENGE') {
+      const parsed = safeParseJson(combinedArgs);
+      if (parsed.ok && parsed.value.id) {
+        actions.adaptChallenges.push(parsed.value);
+        logTelemetry('parser.valid_action', { intent: 'MEM_ADAPT_CHALLENGE' });
+      } else {
+        addFailed('MEM_ADAPT_CHALLENGE', observed, 'malformed_tag', SUGGESTED.MEM_ADAPT_CHALLENGE);
+        addHelp('MEM_ADAPT_CHALLENGE');
+      }
     }
-  }
 
-  // SCHEDULE
-  const schedMatch = RE_SCHEDULE_SMART.exec(normalized);
-  if (schedMatch) {
-    let text = schedMatch[1].trim().toLowerCase();
-    if (text) {
-      let secs = -1;
-      const m = text.match(/(\d+)/);
-      if (m) {
-        if (text.includes('min')) {
-          secs = parseInt(m[1]) * 60;
-        } else if (text.includes('hour')) {
-          secs = parseInt(m[1]) * 3600;
-        } else {
-          secs = parseInt(m[1]);
+    else if (intent === 'MEM_ADAPT_WEAKEN') {
+      const parsed = safeParseJson(combinedArgs);
+      if (parsed.ok && parsed.value.id && typeof parsed.value.amount === 'number') {
+        actions.adaptWeakens.push(parsed.value);
+        logTelemetry('parser.valid_action', { intent: 'MEM_ADAPT_WEAKEN' });
+      } else {
+        addFailed('MEM_ADAPT_WEAKEN', observed, 'malformed_tag', SUGGESTED.MEM_ADAPT_WEAKEN);
+        addHelp('MEM_ADAPT_WEAKEN');
+      }
+    }
+
+    else if (intent === 'SCHEDULE') {
+      const nums = [...combinedArgs.matchAll(/\d+/g)].map(m => Number.parseInt(m[0], 10));
+      if (nums.length > 0) {
+        // Do NOT clamp here — clamping is exclusively the scheduler's responsibility (SSOT: clampSchedule)
+        actions.scheduleSec = nums[0];
+        actions.scheduleSecParsed = true;
+        logTelemetry('parser.valid_action', { intent: 'SCHEDULE', seconds: actions.scheduleSec });
+      } else {
+        addFailed('SCHEDULE', observed, 'malformed_tag', SUGGESTED.SCHEDULE);
+        addHelp('SCHEDULE');
+      }
+    }
+
+    else if (intent === 'REFLECT') {
+      actions.reflect = true;
+      logTelemetry('parser.valid_action', { intent: 'REFLECT' });
+    }
+
+    else if (intent === 'SEND_MESSAGE') {
+      let msgText = '';
+      const startBrace = combinedArgs.indexOf('{');
+      if (startBrace >= 0) {
+        const parsed = safeParseJson(combinedArgs.substring(startBrace));
+        if (parsed.ok && parsed.value.text) {
+          msgText = parsed.value.text;
         }
       }
       
-      if (secs > 0) {
-        actions.scheduleSec = Math.min(Math.max(secs, 10), 900);
-        // Minor hint if they used text
-        if (!/^\d+$/.test(text)) {
-          addHint('SCHEDULE', `[SCHEDULE] ${text.slice(0, 20)}`, `[SCHEDULE ${actions.scheduleSec}]`, `Action successful. Text converted to seconds. Recommended format: [SCHEDULE ${actions.scheduleSec}]`, true);
-        }
+      if (!msgText) {
+        msgText = cleanProseText(combinedArgs);
+      }
+
+      if (msgText) {
+        actions.messages.push(msgText);
+        logTelemetry('parser.valid_action', { intent: 'SEND_MESSAGE' });
       } else {
-         addHint('SCHEDULE', `[SCHEDULE] ${text.slice(0, 20)}`, `[SCHEDULE 60]`, "To schedule a delay, specify a number.", false);
-         addHelp('SCHEDULE');
+        addFailed('SEND_MESSAGE', observed, 'empty_tag', SUGGESTED.SEND_MESSAGE);
+        addHelp('SEND_MESSAGE');
       }
-    } else {
-       addHint('SCHEDULE', `[SCHEDULE]`, `[SCHEDULE 60]`, "To schedule a delay, specify a number.", false);
-       addHelp('SCHEDULE');
     }
-  }
 
-  // REFLECT
-  RE_REFLECT.lastIndex = 0;
-  while ((match = RE_REFLECT.exec(normalized)) !== null) {
-    const rawText = match[1] ? match[1].trim() : '';
-    const prose = extractProse(rawText);
-    if (prose.length > 5 && !prose.startsWith('{') && !prose.startsWith('[')) {
-      actions.reflect = true;
-      actions.saves.push({ kind: 'short', entry: { type: 'question', content: prose, priority: 'normal', why: "Saved question prior to reflection." } });
-      addHint('REFLECT', `[REFLECT] - ${prose.slice(0,30)}`, `[MEM_SAVE short] {"type":"question","content":"...","why":"..."}\n[REFLECT]`, "Action successful. Prose saved to memory and reflection triggered.", true);
-    } else {
-      actions.reflect = true;
+    else if (intent === 'HELP_ACTIONS') {
+      actions.helpRequests.push("ALL");
+      logTelemetry('parser.help_requested', { scope: 'ALL' });
     }
-  }
 
-  // SEND_MESSAGE
-  RE_SEND_MSG.lastIndex = 0;
-  while ((match = RE_SEND_MSG.exec(normalized)) !== null) {
-    const rawJson = match[1].trim();
-    const parsed = safeParseJson(rawJson);
-    const observedTag = `[SEND_MESSAGE] ${rawJson.slice(0, 30)}...`;
-    if (parsed.ok && parsed.value.text) {
-      if (!parsed.value.why) parsed.value.why = "Agent chose to send a user-visible message.";
-      actions.messages.push(parsed.value.text);
-    } else {
-      const prose = extractProse(rawJson);
-      if (prose.length > 0 && !prose.startsWith('{')) {
-         actions.messages.push(prose);
-         addHint('SEND_MESSAGE', observedTag, `[SEND_MESSAGE] {"text":"...","why":"..."}`, "Message sent successfully. For full control, use JSON.", true);
-      } else if (prose.length > 0) {
-         const raw = extractProse(rawJson);
-         actions.messages.push(raw);
-         addHint('SEND_MESSAGE', observedTag, `[SEND_MESSAGE] {"text":"..."}`, "JSON error. Raw text sent to user.", false);
-      } else {
-         addHint('SEND_MESSAGE', `[SEND_MESSAGE]`, `[SEND_MESSAGE] {"text":"..."}`, "Empty message tag.", false);
+    else if (intent === 'HELP_ACTION') {
+      const wordMatch = combinedArgs.match(/"([^"]+)"|'([^']+)'|(\b\w+\b)/);
+      const actionName = wordMatch ? (wordMatch[1] || wordMatch[2] || wordMatch[3]) : '';
+      if (actionName) {
+        addHelp(actionName.trim().toUpperCase());
+        logTelemetry('parser.help_requested', { scope: actionName.trim().toUpperCase() });
       }
     }
   }
 
-  // HELP_ACTIONS
-  if (RE_HELP_ACTIONS.test(normalized)) {
-    actions.helpRequests.push("ALL");
-  } else {
-    RE_HELP_ACTION.lastIndex = 0;
-    while ((match = RE_HELP_ACTION.exec(normalized)) !== null) {
-      addHelp(match[1].trim());
+  commandRanges.sort((a, b) => b.start - a.start);
+  let clearText = normalized;
+  for (const range of commandRanges) {
+    clearText = clearText.substring(0, range.start) + clearText.substring(range.end);
+  }
+  clearText = clearText.replace(/\s+/g, ' ').trim();
+
+  // ========== HALLUCINATION PATTERN DETECTOR ==========
+  // Runs on `normalized` (original text before tag-stripping) so it sees everything
+  // that the main RE_ANY_TAG pass already handled, but only fires on spans NOT already
+  // captured (pattern logic skips already-processed ranges via alreadyCovered set).
+  // Limit: max 3 hallucinations per cycle to avoid prompt spam.
+  processHallucinationPatterns(normalized, actions, addToolHint, logTelemetry, SUGGESTED);
+
+  // ========== HASHTAG PARSING & PROSE DETECTORS ==========
+  // 1. Numeric hashtags (#123 or #S123 or #L123) in reasoning -> auto-focus by ID
+  const numericHashtags = [...clearText.matchAll(/#([SL]?\d+)\b/gi)].map(m => m[1].toUpperCase());
+  for (const raw of numericHashtags) {
+    const formatted = /^\d+$/.test(raw) ? 'S' + raw : raw;
+    if (!actions.focusIds.includes(formatted)) {
+      actions.focusIds.push(formatted);
     }
   }
 
-  // Bare tag detector
-  const knownTags = ['MEM_SAVE', 'MEM_DELETE', 'MEM_FOCUS', 'MEM_ADAPT', 'MEM_ADAPT_CHALLENGE', 'MEM_ADAPT_WEAKEN', 'SCHEDULE', 'REFLECT', 'SEND_MESSAGE'];
-  for (const tag of knownTags) {
-    const regex = new RegExp(`\\[${tag}\\b(.*?)\\]`, 'g');
-    let m;
-    while ((m = regex.exec(normalized)) !== null) {
-      let hasAction = false;
-      if (tag === 'MEM_SAVE' && actions.saves.length > 0) hasAction = true;
-      if (tag === 'MEM_DELETE' && actions.deletes.length > 0) hasAction = true;
-      if (tag === 'MEM_FOCUS' && (actions.focusIds.length > 0 || actions.focusTopics.length > 0)) hasAction = true;
-      if (tag === 'MEM_ADAPT' && actions.adapts.length > 0) hasAction = true;
-      if (tag === 'MEM_ADAPT_CHALLENGE' && actions.adaptChallenges.length > 0) hasAction = true;
-      if (tag === 'MEM_ADAPT_WEAKEN' && actions.adaptWeakens.length > 0) hasAction = true;
-      if (tag === 'SCHEDULE' && actions.scheduleSec !== config.defaultIntervalSec) hasAction = true;
-      if (tag === 'REFLECT' && actions.reflect) hasAction = true;
-      if (tag === 'SEND_MESSAGE' && actions.messages.length > 0) hasAction = true;
-      
-      if (!hasAction && !actions.helpRequests.includes(tag)) {
-        if (tag === 'MEM_SAVE' && /#[0-9]+/.test(m[1])) {
-           const ids = [...m[1].matchAll(/\d+/g)].map(x => Number.parseInt(x[0], 10));
-           actions.focusIds.push(...ids);
-           addHint('MEM_FOCUS', `[MEM_SAVE ${m[1].trim()}]`, `[MEM_FOCUS ${ids.map(id => '#' + id).join(' ')}]`, "Action successful. Use MEM_FOCUS to bring existing records into context instead of MEM_SAVE.", true);
-        } else {
-           addHint(tag, `[${tag}]`, `[${tag} ...]`, `Bare tag detected. If you want to use this tool, follow the exact syntax.`, false);
-           actions.helpRequests.push(tag);
-        }
-      }
+  // 2. Conceptual hashtags (#topic) in reasoning -> auto-search by keyword
+  const conceptualHashtags = [...clearText.matchAll(/#([a-zA-Zа-яА-ЯёЁ_]{2,})\b/g)].map(m => m[1]);
+  for (const topic of conceptualHashtags) {
+    if (['MEM_SAVE', 'MEM_FOCUS', 'MEM_DELETE', 'MEM_ADAPT', 'SCHEDULE', 'REFLECT', 'SEND_MESSAGE'].includes(topic.toUpperCase())) {
+      continue;
+    }
+    const topicLower = topic.toLowerCase();
+    if (!actions.focusTopics.some(t => t.topic.toLowerCase() === topicLower)) {
+      actions.focusTopics.push({ topic: topic, limit: 5 });
     }
   }
 
-  // Weak Intent Detector
+  // 3. Prose "focus" or "focused" detection -> auto-inject syntax hint
+  const hasFocusWords = /\b(focus|focused)\b/i.test(clearText);
+  if (hasFocusWords && actions.focusIds.length === 0 && actions.focusTopics.length === 0) {
+    actions.feedback.hints.push({
+      intent: 'MEM_FOCUS',
+      observed: 'Word "focus" in prose',
+      suggested: '[MEM_FOCUS #ID] (focus ID) or [MEM_FOCUS topic] (search)',
+      explanation: 'You mentioned "focus" or "focused" in your thoughts. You can use hashtags like #83 to focus a memory by ID, or #topic to search all memory.'
+    });
+  }
+
+  // ========== Weak Intent Detector (TOOL HINT) ==========
   const weakDetector = [
-    { regex: /(?:\bI should|\bmight be worth)\s*(?:maybe\s*)?(?:save|remember)(?:ing)?\b/i, intent: 'MEM_SAVE', sug: '[MEM_SAVE short] {"type":"thought","content":"...","priority":"normal","why":"..."}' },
+    { regex: /(?:\bI should|\bmight be worth)\s*(?:maybe\s*)?(?:save|remember)(?:ing)?\b/i, intent: 'MEM_SAVE', sug: SUGGESTED.MEM_SAVE },
     { regex: /\bfocus on #(\d+)\b/i, intent: 'MEM_FOCUS', sug: '[MEM_FOCUS #$1]' },
     { regex: /\breview #(\d+)\b/i, intent: 'MEM_FOCUS', sug: '[MEM_FOCUS #$1]' },
-    { regex: /\b(think about later|reflect on this)\b/i, intent: 'REFLECT', sug: '[REFLECT]' },
-    { regex: /\b(tell user|write to user)\b/i, intent: 'SEND_MESSAGE', sug: '[SEND_MESSAGE] {"text":"...","why":"..."}' },
-    { regex: /\b(change my habit|change how I think|suppress this tendency)\b/i, intent: 'MEM_ADAPT', sug: '[MEM_ADAPT] {"type":"suppress","target":"...","rule":"...","why":"..."}' }
+    { regex: /\b(think about later|reflect on this)\b/i, intent: 'REFLECT', sug: SUGGESTED.REFLECT },
+    { regex: /\b(tell user|write to user|message the user)\b/i, intent: 'SEND_MESSAGE', sug: SUGGESTED.SEND_MESSAGE },
+    { regex: /\b(change my habit|change how I think|suppress this tendency|I want to adapt|I should adapt)\b/i, intent: 'MEM_ADAPT', sug: SUGGESTED.MEM_ADAPT },
+    { regex: /\b(I want to schedule|I need to schedule)\b/i, intent: 'SCHEDULE', sug: SUGGESTED.SCHEDULE }
   ];
 
-  for (const w of weakDetector) {
-    const wm = clearText.match(w.regex);
-    if (wm) {
-      let executed = false;
-      if (w.intent === 'MEM_SAVE' && actions.saves.length > 0) executed = true;
-      if (w.intent === 'MEM_FOCUS' && actions.focusIds.length > 0) executed = true;
-      if (w.intent === 'REFLECT' && actions.reflect) executed = true;
-      if (w.intent === 'SEND_MESSAGE' && actions.messages.length > 0) executed = true;
-      if (w.intent === 'MEM_ADAPT' && actions.adapts.length > 0) executed = true;
-      
-      if (!executed) {
+  const hasAnyAction = actions.saves.length > 0 || actions.deletes.length > 0 ||
+    actions.adapts.length > 0 || actions.messages.length > 0 ||
+    actions.focusIds.length > 0 || actions.focusTopics.length > 0 ||
+    actions.reflect || actions.scheduleSec !== config.defaultIntervalSec ||
+    actions.feedback.failed.length > 0;
+
+  if (!hasAnyAction) {
+    for (const w of weakDetector) {
+      const wm = clearText.match(w.regex);
+      if (wm) {
         let suggested = w.sug;
         if (wm[1]) suggested = suggested.replace('$1', wm[1]);
-        addHint(w.intent, `Prose: "${wm[0]}"`, suggested, `You expressed an intent to ${w.intent.toLowerCase()} but didn't use a tool. Tool actions must use exact tags. You may ignore this if thinking is sufficient.`, true);
+        addToolHint(w.intent, `Prose: "${wm[0]}"`, suggested,
+          `You seemed to consider using ${w.intent} but no explicit action was attempted.`);
+        break; // Only one tool hint per cycle
       }
     }
   }
+
+  // ========== NO-SILENT MEM TAGS INVARIANT ==========
+  const parsedMemCount = actions.saves.length + actions.deletes.length +
+    actions.adapts.length + actions.adaptChallenges.length + actions.adaptWeakens.length +
+    actions.focusIds.length + actions.focusTopics.length;
+  const hasMemTagInText = /\[MEM_/.test(normalized);
+  if (hasMemTagInText && parsedMemCount === 0 && actions.feedback.failed.length === 0) {
+    const firstTagMatch = normalized.match(/\[MEM_[^\]]{0,40}\]/) || [];
+    const observed = firstTagMatch[0] || '[MEM_???]';
+    addFailed(
+      'MEM_?',
+      observed,
+      'tag_not_parsed',
+      'Detected MEM tags but none were parsed. Use canonical syntax:\n' +
+      `${SUGGESTED.MEM_SAVE}\n${SUGGESTED.MEM_FOCUS}\n${SUGGESTED.MEM_DELETE}`
+    );
+    addHelp('MEM_SAVE');
+    logTelemetry('parser.silent_mem_detected', { observed: observed.slice(0, 60) });
+  }
+
+  // Очистка мыслей от галлюцинированных секций промпта
+  const promptSections = [
+    /\[ACTION FEEDBACK\][\s\S]*/i,
+    /\[TOOL HINT\][\s\S]*/i,
+    /\[CURRENT TIME\][\s\S]*/i,
+    /\[WORKING CONTEXT\][\s\S]*/i,
+    /\[SHORT_MEM\][\s\S]*/i,
+    /\[LONG_MEM\][\s\S]*/i,
+    /\[BIOLOGICAL ADAPTATIONS\][\s\S]*/i,
+    /\[MESSAGES FROM USER\][\s\S]*/i
+  ];
+  for (const rx of promptSections) {
+    clearText = clearText.replace(rx, '');
+  }
+  clearText = clearText.replace(/\s+/g, ' ').trim();
 
   actions.thought = clearText;
   return actions;
@@ -450,5 +905,5 @@ function parseOutput(text) {
 
 module.exports = {
   parseOutput,
-  logParseError
+  logTelemetry
 };

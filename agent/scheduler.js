@@ -2,6 +2,20 @@ const config = require('./config');
 
 let timer = null;
 let isRunning = false;
+let nextRunTime = null;
+
+/**
+ * Зажать значение интервала сна по конфигурационным лимитам.
+ * SSOT: config.scheduleMinSec и config.scheduleMaxSec.
+ * Экспортируется для юнит-тестирования.
+ * @param {number|undefined} seconds
+ * @returns {number} appliedDelaySec — реальное значение после клампинга
+ */
+function clampSchedule(seconds) {
+  const s = Number(seconds);
+  const raw = Number.isFinite(s) ? s : config.defaultIntervalSec;
+  return Math.min(config.scheduleMaxSec, Math.max(config.scheduleMinSec, raw));
+}
 
 /**
  * Очистить текущий запланированный запуск.
@@ -10,30 +24,29 @@ function clearScheduledRun() {
   if (timer) {
     clearTimeout(timer);
     timer = null;
+    nextRunTime = null;
   }
 }
 
 /**
  * Запланировать следующий запуск агента.
  * @param {Function} runAgent — функция главного цикла
- * @param {number} seconds — задержка в секундах (кламируется в [60, maxInterval])
+ * @param {number} seconds — желаемая задержка (будет зажата через clampSchedule)
+ * @returns {{ appliedDelaySec: number, nextAt: Date }}
  */
 function scheduleNext(runAgent, seconds) {
   clearScheduledRun();
 
-  const delaySec = Math.min(
-    86400, // максимум 24 часа
-    Math.max(60, Number(seconds) || config.defaultIntervalSec)
-  );
-
-  const nextAt = new Date(Date.now() + delaySec * 1000);
+  const appliedDelaySec = clampSchedule(seconds);
+  const nextAt = new Date(Date.now() + appliedDelaySec * 1000);
+  nextRunTime = nextAt;
 
   timer = setTimeout(() => {
     runSafely(runAgent);
-  }, delaySec * 1000);
+  }, appliedDelaySec * 1000);
 
-  console.log(`[SCHEDULER] Следующий запуск: ${nextAt.toLocaleString()} (через ${delaySec}с)`);
-  return { delaySec, nextAt };
+  console.log(`[SCHEDULER] Следующий запуск: ${nextAt.toLocaleString()} (через ${appliedDelaySec}с)`);
+  return { appliedDelaySec, nextAt };
 }
 
 /**
@@ -58,7 +71,9 @@ async function runSafely(runAgent) {
 }
 
 module.exports = {
+  clampSchedule,
   scheduleNext,
   runSafely,
-  clearScheduledRun
+  clearScheduledRun,
+  getSchedulerState: () => ({ isRunning, nextRunTime })
 };

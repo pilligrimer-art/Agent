@@ -73,19 +73,46 @@ function renderMemory(items, container, kind) {
         const div = document.createElement('div');
         div.className = 'memory-item';
         
-        const priorityHtml = item.priority ? `<span class="priority">${item.priority}</span>` : '';
-        const tagsHtml = item.tags ? `<span>🏷️ ${item.tags}</span>` : `<span>ID: ${item.id}</span>`;
-        
-        div.innerHTML = `
-            <button class="delete-btn" onclick="deleteMemory('${kind}', ${item.id})" title="Удалить">×</button>
-            <span class="type">${item.type}</span>
-            ${priorityHtml}
-            <div class="content">${item.content}</div>
-            <div class="meta">
-                ${tagsHtml}
-                <span>${item.created.split(' ')[1]}</span>
-            </div>
-        `;
+        const delBtn = document.createElement('button');
+        delBtn.className = 'delete-btn';
+        delBtn.title = 'Удалить';
+        delBtn.textContent = '×';
+        delBtn.onclick = () => deleteMemory(kind, item.id);
+        div.appendChild(delBtn);
+
+        const typeSpan = document.createElement('span');
+        typeSpan.className = 'type';
+        typeSpan.textContent = item.type;
+        div.appendChild(typeSpan);
+
+        if (item.priority) {
+            const prioSpan = document.createElement('span');
+            prioSpan.className = 'priority';
+            prioSpan.textContent = item.priority;
+            div.appendChild(prioSpan);
+        }
+
+        const contentDiv = document.createElement('div');
+        contentDiv.className = 'content';
+        contentDiv.textContent = item.content;
+        div.appendChild(contentDiv);
+
+        const metaDiv = document.createElement('div');
+        metaDiv.className = 'meta';
+
+        const tagsSpan = document.createElement('span');
+        if (item.tags) {
+            tagsSpan.textContent = '🏷️ ' + item.tags;
+        } else {
+            tagsSpan.textContent = 'ID: ' + item.id;
+        }
+        metaDiv.appendChild(tagsSpan);
+
+        const timeSpan = document.createElement('span');
+        timeSpan.textContent = item.created ? item.created.split(' ')[1] : '';
+        metaDiv.appendChild(timeSpan);
+
+        div.appendChild(metaDiv);
         container.appendChild(div);
     });
 }

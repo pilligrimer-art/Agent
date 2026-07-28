@@ -89,6 +89,11 @@ if (!existingTriggers.has('long_mem_ad')) {
   `);
 }
 
+// Очистка STM от тревожных системных ошибок при старте
+try {
+  db.prepare("DELETE FROM short_mem WHERE type = 'error'").run();
+} catch (_) {}
+
 // Корректное закрытие БД при завершении процесса
 process.on('exit', () => {
   try { db.close(); } catch (_) { /* уже закрыта */ }

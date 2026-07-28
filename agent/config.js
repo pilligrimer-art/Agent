@@ -10,6 +10,11 @@ function intEnv(name, fallback) {
   return Number.isFinite(value) ? value : fallback;
 }
 
+function floatEnv(name, fallback) {
+  const value = Number.parseFloat(process.env[name]);
+  return Number.isFinite(value) ? value : fallback;
+}
+
 function pathEnv(name, fallback) {
   const raw = process.env[name] || fallback;
   return path.isAbsolute(raw) ? raw : path.resolve(rootDir, raw);
@@ -18,10 +23,21 @@ function pathEnv(name, fallback) {
 const config = {
   rootDir,
   ollamaHost:           process.env.OLLAMA_HOST || 'http://localhost:11434',
+  ollamaNumCtx:         intEnv('OLLAMA_NUM_CTX', 8192),
+  ollamaTimeout:        intEnv('OLLAMA_TIMEOUT_MS', 300000),
+  temperature:          floatEnv('TEMPERATURE', 0.2),
   modelName:            process.env.MODEL_NAME  || 'gemma3:4b',
+  featureProactiveRecall: intEnv('FEATURE_PROACTIVE_RECALL', 0),
+  // Schedule clamp bounds — env-driven SSOT for all schedule limits.
+  // Test defaults: 10..90s. Prod: set SCHEDULE_MAX_SEC=900 (or 86400) in .env.
+  scheduleMinSec:       intEnv('SCHEDULE_MIN_SEC', 10),
+  scheduleMaxSec:       intEnv('SCHEDULE_MAX_SEC', 90),
   defaultIntervalSec:   intEnv('DEFAULT_INTERVAL_SEC', 60),
   // 60% Рабочий контекст: последние мысли
   maxHistoryInContext:  intEnv('MAX_HISTORY_IN_CONTEXT', 1),
+  
+  // STM Cycle limit before auto-archiving
+  maxStmCycles:         intEnv('MAX_STM_CYCLES', 4),
   
   // 30% Краткосрочная память: выжимки (до 1 абзаца)
   maxShortMemInContext: intEnv('MAX_SHORT_MEM_IN_CONTEXT', 5),

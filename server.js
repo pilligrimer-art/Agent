@@ -5,9 +5,9 @@ const config = require('./agent/config');
 require('./agent/db');
 const mem = require('./agent/memory_manager');
 const { buildContext } = require('./agent/context_builder');
-const { parseOutput, logParseError } = require('./agent/output_parser');
+const { parseOutput, logTelemetry } = require('./agent/output_parser');
 const { scheduleNext, clearScheduledRun } = require('./agent/scheduler');
-const { runAgent, callOllama, runReflection, pushUserMessage, getChatHistory } = require('./agent/index');
+const { runAgent, callOllama, runReflection, pushUserMessage, getChatHistory, getAgentState } = require('./agent/index');
 
 const app = express();
 const PORT = process.env.WEB_PORT || 3000;
@@ -15,27 +15,20 @@ const PORT = process.env.WEB_PORT || 3000;
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
-// --- Состояние агента ---
-const state = {
-  status: 'idle',        // idle | thinking | reflecting
-  lastRun: null,
-  lastThought: null,
-  lastError: null,
-  nextRunAt: null,
-  totalRuns: 0
-};
+// No local state needed anymore, we query getAgentState()
 
 // --- API ---
 
 // Получить полное состояние
 app.get('/api/status', (req, res) => {
+  const agentState = getAgentState();
   res.json({
-    status: state.status,
-    lastRun: state.lastRun,
-    lastThought: state.lastThought,
-    lastError: state.lastError,
-    nextRunAt: state.nextRunAt,
-    totalRuns: state.totalRuns,
+    status: agentState.status,
+    lastRun: agentState.lastRun,
+    lastThought: agentState.lastThought,
+    lastError: null, // Error is now just in logs
+    nextRunAt: agentState.nextRunAt,
+    totalRuns: agentState.totalRuns,
     model: config.modelName,
     shortCount: mem.countShort(),
     longCount: mem.countLong()
@@ -61,6 +54,18 @@ app.get('/api/memory/search', (req, res) => {
 // Добавить запись вручную
 app.post('/api/memory/add', (req, res) => {
   const { kind, type, content, priority, tags } = req.body;
+  if (typeof content !== 'string' || content.trim() === '' || content.length > 10000) {
+    return res.status(400).json({ ok: false, error: 'Invalid input: content' });
+  }
+  if (!['thought', 'task', 'insight', 'question', 'plan', 'reminder', 'knowledge', 'reflection'].includes(type)) {
+    return res.status(400).json({ ok: false, error: 'Invalid input: type' });
+  }
+  if (priority && !['high', 'normal', 'low'].includes(priority)) {
+    return res.status(400).json({ ok: false, error: 'Invalid input: priority' });
+  }
+  if (kind !== 'short' && kind !== 'long') {
+    return res.status(400).json({ ok: false, error: 'Invalid input: kind' });
+  }
   try {
     if (kind === 'short') {
       const entry = mem.addShort(type || 'task', content, priority || 'normal');
@@ -96,29 +101,20 @@ app.post('/api/message', (req, res) => {
 
 // Запустить агента вручную
 app.post('/api/run', async (req, res) => {
-  if (state.status !== 'idle') {
+  const agentState = getAgentState();
+  if (agentState.status !== 'idle') {
     return res.json({ ok: false, error: 'Агент уже работает' });
   }
-  state.status = 'thinking';
+  
   res.json({ ok: true, message: 'Запуск...' });
 
   try {
-    // В ручном запуске мы просто эмулируем вызов основного агента, 
-    // но в реальности лучше вызывать runSafely(runAgent), 
-    // чтобы работала общая логика с очередью.
     clearScheduledRun();
     const { runSafely } = require('./agent/scheduler');
-    await runSafely(runAgent);
-    
-    state.lastThought = "Мысль сгенерирована, посмотрите логи или рабочий контекст.";
-    state.lastError = null;
-    state.lastRun = new Date().toISOString();
-    state.totalRuns++;
-
+    // We don't await this so the request returns immediately and the agent runs in background
+    runSafely(runAgent);
   } catch (err) {
-    state.lastError = err.message;
-  } finally {
-    state.status = 'idle';
+    console.error('Run failed:', err);
   }
 });
 
@@ -142,16 +138,12 @@ app.get('/api/logs', (req, res) => {
 });
 
 // Запуск сервера
-app.listen(PORT, async () => {
+app.listen(PORT, '127.0.0.1', async () => {
   console.log(`[WEB] Интерфейс: http://localhost:${PORT}`);
   
   // Автоматический старт агента
   console.log('[SYSTEM] Инициализация агента...');
   mem.initBaseAdaptations();
-  const { injectSystemMessage } = require('./agent/index');
-  if (injectSystemMessage) {
-    injectSystemMessage('[SYSTEM] Environment started (start.bat was executed).');
-  }
   
   const { runSafely } = require('./agent/scheduler');
   await runSafely(runAgent);

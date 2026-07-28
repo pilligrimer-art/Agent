@@ -1,0 +1,96 @@
+{
+  "summary": {
+    "total_log_lines": 1083,
+    "total_malformed_events": 112,
+    "total_valid_events": 448,
+    "parse_error_rate": 0.2,
+    "mined_dpo_records": 21
+  },
+  "event_type_distribution": {
+    "parser.valid_action": 448,
+    "parser.hint_created": 144,
+    "parser.help_requested": 143,
+    "parser.malformed_intent": 112,
+    "parser.hallucination_repaired": 95,
+    "parser.legacy": 72,
+    "parser.hallucination_hint": 46,
+    "parser.repaired_action": 10,
+    "parser.silent_mem_detected": 7,
+    "parser.id_mistake": 6
+  },
+  "malformed_by_intent": {
+    "MEM_SAVE": 59,
+    "SCHEDULE": 23,
+    "SEND_MESSAGE": 7,
+    "MEM_?": 7,
+    "MEM_ADAPT": 6,
+    "REFLECT": 5,
+    "MEM_FOCUS": 5
+  },
+  "malformed_by_reason": {
+    "malformed_tag": 54,
+    "id_not_valid_for_save": 32,
+    "empty_tag": 19,
+    "tag_not_parsed": 7
+  },
+  "mined_by_failure_class": {
+    "dash_separator": 12,
+    "id_in_save_should_be_focus": 5,
+    "empty_tag_no_payload": 2,
+    "mem_focus_malformed": 1,
+    "schedule_malformed": 1
+  },
+  "valid_by_intent": {
+    "MEM_FOCUS": 145,
+    "MEM_SAVE": 135,
+    "SCHEDULE": 104,
+    "SEND_MESSAGE": 30,
+    "REFLECT": 20,
+    "MEM_DELETE": 8,
+    "MEM_ADAPT": 6
+  },
+  "training_priority": [
+    {
+      "intent": "MEM_SAVE",
+      "failure_count": 59,
+      "recommended_additional_dpo_pairs": 177,
+      "priority": "HIGH"
+    },
+    {
+      "intent": "SCHEDULE",
+      "failure_count": 23,
+      "recommended_additional_dpo_pairs": 69,
+      "priority": "MEDIUM"
+    },
+    {
+      "intent": "SEND_MESSAGE",
+      "failure_count": 7,
+      "recommended_additional_dpo_pairs": 21,
+      "priority": "LOW"
+    },
+    {
+      "intent": "MEM_?",
+      "failure_count": 7,
+      "recommended_additional_dpo_pairs": 21,
+      "priority": "LOW"
+    },
+    {
+      "intent": "MEM_ADAPT",
+      "failure_count": 6,
+      "recommended_additional_dpo_pairs": 18,
+      "priority": "LOW"
+    },
+    {
+      "intent": "REFLECT",
+      "failure_count": 5,
+      "recommended_additional_dpo_pairs": 15,
+      "priority": "LOW"
+    },
+    {
+      "intent": "MEM_FOCUS",
+      "failure_count": 5,
+      "recommended_additional_dpo_pairs": 15,
+      "priority": "LOW"
+    }
+  ]
+}

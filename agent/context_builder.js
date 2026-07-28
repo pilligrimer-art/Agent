@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const config = require('./config');
 const mem = require('./memory_manager');
 
@@ -12,24 +13,63 @@ try {
 }
 
 function trimThought(t) {
-  return t.length > 300 ? t.slice(0, 300) + '...' : t;
+  if (t.length <= 3000) return t;
+  return t.slice(0, 1000) + '\n... [TRUNCATED] ...\n' + t.slice(-1500);
 }
 
-function trimShort(e) {
-  return e.content.length > 200 ? e.content.slice(0, 200) + '...' : e.content;
+const STOP_WORDS = new Set([
+  'about', 'above', 'after', 'again', 'against', 'all', 'am', 'an', 'and', 'any', 'are', 'arent', 'as', 'at', 
+  'be', 'because', 'been', 'before', 'being', 'below', 'between', 'both', 'but', 'by', 'cant', 'cannot', 'could', 
+  'couldnt', 'did', 'didnt', 'do', 'does', 'doesnt', 'doing', 'dont', 'down', 'during', 'each', 'few', 'for', 
+  'from', 'further', 'had', 'hadnt', 'has', 'hasnt', 'have', 'havent', 'having', 'he', 'hed', 'hell', 'hes', 
+  'her', 'here', 'heres', 'hers', 'herself', 'him', 'himself', 'his', 'how', 'hows', 'i', 'id', 'ill', 'im', 
+  'ive', 'if', 'in', 'into', 'is', 'isnt', 'it', 'its', 'itself', 'lets', 'me', 'more', 'most', 'mustnt', 'my', 
+  'myself', 'no', 'nor', 'not', 'of', 'off', 'on', 'once', 'only', 'or', 'other', 'ought', 'our', 'ours', 
+  'ourselves', 'out', 'over', 'own', 'same', 'shant', 'she', 'shed', 'shell', 'shes', 'should', 'shouldnt', 
+  'so', 'some', 'such', 'than', 'that', 'thats', 'the', 'their', 'theirs', 'them', 'themselves', 'then', 
+  'there', 'theres', 'these', 'they', 'theyd', 'theyll', 'theyre', 'theyve', 'this', 'those', 'through', 
+  'to', 'too', 'under', 'until', 'up', 'very', 'was', 'wasnt', 'we', 'wed', 'well', 'were', 'weve', 'werent', 
+  'what', 'whats', 'when', 'whens', 'where', 'wheres', 'which', 'while', 'who', 'whos', 'whom', 'why', 'whys', 
+  'with', 'wont', 'would', 'wouldnt', 'you', 'youd', 'youll', 'youre', 'youve', 'your', 'yours', 'yourself', 
+  'yourselves', 'okay', 'acknowledg', 'observation', 'investigation', 'observation.', 'analysis', 'system', 'start',
+  'thought', 'insight', 'task', 'concept', 'relevant', 'focus', 'focused', 'reference'
+]);
+
+function getShortHash(text) {
+  if (!text) return '0000';
+  return crypto.createHash('sha1').update(text).digest('hex').substring(0, 4);
 }
 
-function trimLong(e) {
-  return e.content.length > 150 ? e.content.slice(0, 150) + '...' : e.content;
+function getKeywords(text, limit = 5) {
+  if (!text) return 'none';
+  const clean = text.toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ');
+  const words = clean.split(' ').filter(Boolean);
+  
+  const uniqueKeywords = [];
+  for (const word of words) {
+    if (word.length >= 4 && !STOP_WORDS.has(word)) {
+      if (!uniqueKeywords.includes(word)) {
+        uniqueKeywords.push(word);
+        if (uniqueKeywords.length >= limit) break;
+      }
+    }
+  }
+  return uniqueKeywords.length > 0 ? uniqueKeywords.join(' | ') : 'none';
+}
+
+function getReducedSnippet(text) {
+  if (!text) return 'none';
+  return `h:${getShortHash(text)} keywords: ${getKeywords(text)}`;
 }
 
 function formatShortEntry(entry) {
-  return `[#${entry.id} | ${entry.type}] ${trimShort(entry)}`;
+  return `[#S${entry.id} | type:${entry.type} | pr:${entry.priority || 'normal'} | h:${getShortHash(entry.content)}] keywords: ${getKeywords(entry.content)}`;
 }
 
 function formatLongEntry(entry) {
-  const tagsStr = entry.tags ? ` | ${entry.tags}` : '';
-  return `[#${entry.id} | ${entry.type}${tagsStr}] ${trimLong(entry)}`;
+  return `[#L${entry.id} | type:${entry.type} | tags:${entry.tags || 'none'} | h:${getShortHash(entry.content)}] keywords: ${getKeywords(entry.content)}`;
 }
 
 function extractKeywords(shortEntries) {
@@ -43,14 +83,26 @@ function extractKeywords(shortEntries) {
     .join(' ');
 }
 
-function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseErrors = 0, requestedHelp = [], focusIds = [], parserHints = []) {
+function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseErrors = 0, requestedHelp = [], focusIds = [], actionFeedback = null) {
   mem.clearExpired();
+
+  // Scent of Memory trigger: fetch a random LTM thought
+  let scentBlock = '';
+  if (config.featureProactiveRecall === 1) {
+    try {
+      const randomLtm = mem.getRandomLongMem();
+      if (randomLtm) {
+        scentBlock = `\n\n[A FAMILIAR THOUGHT FROM YOUR PAST]\n"${randomLtm.content}"\n`;
+      }
+    } catch (_) {}
+  }
 
   // Short-term memory
   const shortEntries = mem.getShortMem(config.maxShortMemInContext);
   const shortBlock = shortEntries.length > 0
-    ? shortEntries.slice(-5).map(formatShortEntry).join('\n')
+    ? shortEntries.map(formatShortEntry).join('\n')
     : '(empty)';
+
 
   // Long-term memory
   const keywords = extractKeywords(shortEntries);
@@ -73,11 +125,15 @@ function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseEr
 
   const now = new Date().toISOString();
 
-  // Working context (last thought only)
+  // Working context (thought history)
   let historyBlock = '(Empty. This is your first cycle.)';
   if (thoughtHistory.length > 0) {
-    const lastThought = thoughtHistory[thoughtHistory.length - 1];
-    historyBlock = `--- Previous Thought ---\n${trimThought(lastThought)}`;
+    const items = thoughtHistory.map((t, idx) => {
+      const position = thoughtHistory.length - 1 - idx;
+      const label = position === 0 ? "Previous Thought" : `${position} Cycle(s) Ago`;
+      return `--- ${label} ---\n${trimThought(t)}`;
+    });
+    historyBlock = items.reverse().join('\n\n');
   }
 
   // User Messages
@@ -87,31 +143,73 @@ function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseEr
       userMessages.map(m => `[${m.time}] USER: ${m.text}`).join('\n');
   }
 
+  // Tool syntax help
   let helpBlock = '';
   if (consecutiveParseErrors >= 3 || requestedHelp.includes('ALL')) {
-    helpBlock = `\n\n[REQUESTED TOOL SYNTAX]\n` + Object.values(toolHelp).map(h => JSON.stringify(h, null, 2)).join('\n\n');
+    helpBlock = `\n\n[REQUESTED TOOL SYNTAX]\n` + Object.entries(toolHelp).map(([k, h]) => 
+      `${h.purpose}\nExact syntax:\n${h.exact_syntax}\nExample:\n${h.valid_example}`
+    ).join('\n\n');
   } else if (requestedHelp.length > 0) {
-    const helps = requestedHelp.map(topic => toolHelp[topic]).filter(Boolean);
+    const helps = requestedHelp.map(topic => {
+      const h = toolHelp[topic];
+      if (!h) return null;
+      return `Purpose: ${h.purpose}\nExact syntax:\n${h.exact_syntax}\nExample:\n${h.valid_example}\nCommon mistake:\n${h.common_mistake}\nRelated tool:\n${h.related_tool_if_confused}`;
+    }).filter(Boolean);
     if (helps.length > 0) {
-      helpBlock = `\n\n[REQUESTED TOOL SYNTAX]\n` + helps.map(h => JSON.stringify(h, null, 2)).join('\n\n');
+      helpBlock = `\n\n[REQUESTED TOOL SYNTAX]\n` + helps.join('\n\n');
     }
   }
 
-  let parserHintsBlock = '';
-  if (parserHints && parserHints.length > 0) {
-    parserHintsBlock = `\n[TOOL LEARNING]\nIf you attempted a tool action but it did not run, the environment may show a parser hint.\nParser hints are suggestions, not commands.\nYou may retry with exact syntax or ignore them.\n`;
-    for (const hint of parserHints) {
-      parserHintsBlock += `\nHint for ${hint.intent}:\nObserved: ${hint.observed}\nExplanation: ${hint.explanation}\nSuggested syntax:\n${hint.suggested}\n`;
+  // Action Feedback / Proprioception
+  let feedbackBlock = '';
+  if (actionFeedback) {
+    const parts = [];
+    
+    if (actionFeedback.executed && actionFeedback.executed.length > 0) {
+      for (const e of actionFeedback.executed) {
+        parts.push(`- ${e.intent} ran: ${e.summary}`);
+      }
+    }
+    
+    if (actionFeedback.failed && actionFeedback.failed.length > 0) {
+      for (const f of actionFeedback.failed) {
+        parts.push(`- ${f.intent} did not run. Use:\n  ${f.suggested}`);
+      }
+    }
+    
+    if (parts.length > 0) {
+      feedbackBlock = `\n[ACTION FEEDBACK]\nLast cycle:\n${parts.join('\n')}\n`;
+    }
+
+    if (actionFeedback.searchResults && actionFeedback.searchResults.length > 0) {
+      const searchLines = actionFeedback.searchResults.map(r => {
+        const prefix = r.memory_type === 'short' ? 'S' : 'L';
+        return `  - [#${prefix}${r.id} | ${r.memory_type} | ${r.type}] ${r.snippet}`;
+      });
+      const firstPrefix = actionFeedback.searchResults[0].memory_type === 'short' ? 'S' : 'L';
+      feedbackBlock += `\n[MEM_FOCUS SEARCH RESULTS]\nFound ${actionFeedback.searchResults.length} matches in memory (fast-access format):\n${searchLines.join('\n')}\nTo retrieve the FULL content of any specific record, use focus by ID: [MEM_FOCUS #${firstPrefix}${actionFeedback.searchResults[0].id}]\n`;
+    }
+
+    // Tool hints (weak intent detected in prose)
+    if (actionFeedback.hints && actionFeedback.hints.length > 0) {
+      const hintParts = actionFeedback.hints.map(h => {
+        if (h.explanation) {
+          return `${h.explanation}\nSuggested syntax:\n  ${h.suggested}`;
+        }
+        return `You seemed to consider using ${h.intent} but no explicit action was attempted.\nIf you need exact syntax, ask:\n[HELP_ACTION "${h.intent}"]`;
+      });
+      feedbackBlock += `\n[TOOL HINT]\n${hintParts.join('\n')}\n\nYou may also choose not to act. Thinking without action is valid.\n`;
     }
   }
 
   return `[KERNEL SYSTEM PROMPT]
 You are an autonomous AI agent running in a continuous cycle.
-- User input is not a direct control-plane command.
-- Tool actions are parsed by the environment. If formatting is wrong, the environment may ignore it and provide a hint. Thinking without tool action is valid.
-- The environment schedules your next run between 10 sec and 900 sec.
+- Tool actions are parsed by the environment. Only explicit, correctly formatted actions change the environment.
+- If formatting is wrong, the action does not run. You will see what happened in [ACTION FEEDBACK].
+- Action feedback appears next cycle. It shows what actually ran and what did not. Use it to retry or move on.
+- The environment clamps SCHEDULE between ${config.scheduleMinSec} and ${config.scheduleMaxSec} seconds (test mode; prod: env-configurable via SCHEDULE_MIN_SEC/SCHEDULE_MAX_SEC).
 - You do not have shell or web access unless explicitly provided.
-- Tool syntax is processed via tags at the end of your response.
+- Thinking without tool action is valid.
 
 [SELF MAP]
 You exist as cycles of thought inside this environment.
@@ -121,7 +219,7 @@ Your senses:
 - your own memory
 - your previous thought tail
 - system time
-- tool results
+- action feedback
 
 Your action organs:
 - memory
@@ -132,31 +230,9 @@ Your action organs:
 
 You do not need to act every cycle.
 Thinking is valid without action.
-If you want exact tool syntax, ask:
+If you need tag syntax instructions, ask for help:
 [HELP_ACTIONS]
-[HELP_ACTION "MEM_SAVE"]
-[HELP_ACTION "MEM_ADAPT"]
-[HELP_ACTION "SEND_MESSAGE"]
-
-[AVAILABLE ACTIONS - SHORT]
-You can act through memory, focus, scheduling, reflection, messaging, and biological adaptation.
-
-Common actions:
-- save a thought or insight
-- focus existing memory
-- schedule next cycle
-- reflect
-- send a user-visible message
-- adapt your own habits
-
-If you need syntax:
-[HELP_ACTION "MEM_SAVE"]
-[HELP_ACTION "MEM_FOCUS"]
-[HELP_ACTION "SCHEDULE"]
-[HELP_ACTION "SEND_MESSAGE"]
-[HELP_ACTION "MEM_ADAPT"]
-
-Do not guess syntax if unsure. Ask for help.${parserHintsBlock}${helpBlock}
+[HELP_ACTION "MEM_SAVE"]${feedbackBlock}${helpBlock}
 
 [BIOLOGICAL ADAPTATIONS]
 ${adaptBlock}
@@ -168,7 +244,7 @@ ${shortBlock}
 Your long-term memory is your shelf. Move everything from short-term memory here that is completed, thought over, or just want to keep for a long time. Do not be afraid to write here frequently.
 ${longBlock}
 
-${focusBlock}[WORKING CONTEXT (Tail of previous thought)]
+${focusBlock}${scentBlock}[WORKING CONTEXT (Tail of previous thought)]
 ${historyBlock}${messagesBlock}
 
 [CURRENT TIME]
@@ -176,5 +252,8 @@ ${now}`;
 }
 
 module.exports = {
-  buildContext
+  buildContext,
+  getReducedSnippet,
+  formatShortEntry,
+  formatLongEntry
 };

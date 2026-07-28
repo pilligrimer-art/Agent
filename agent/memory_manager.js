@@ -22,6 +22,7 @@ const stmtGetLongById  = db.prepare('SELECT * FROM long_mem WHERE id = ?');
 
 const stmtGetShort = db.prepare(`
   SELECT * FROM short_mem
+  WHERE type != 'error'
   ORDER BY
     CASE priority WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
     created DESC
@@ -79,13 +80,17 @@ const stmtCountAdaptations = db.prepare('SELECT COUNT(*) AS cnt FROM adaptations
  * @returns {{ id: number }} вставленная запись
  */
 function addShort(type, content, priority = 'normal', expires = null) {
+  let resolvedType = type || 'thought';
+  if (resolvedType === 'error') {
+    resolvedType = 'thought';
+  }
   const info = stmtAddShort.run({
-    type:     type || 'thought',
+    type:     resolvedType,
     content:  String(content).trim(),
     priority: ['high', 'normal', 'low'].includes(priority) ? priority : 'normal',
     expires:  expires || null
   });
-  return { id: info.lastInsertRowid, type, content: String(content).trim(), priority };
+  return { id: info.lastInsertRowid, type: resolvedType, content: String(content).trim(), priority };
 }
 
 /**
@@ -155,13 +160,14 @@ function searchLongMem(keywords, limit) {
   if (!query) return getLongMem(limit);
 
   // Преобразуем слова в FTS5 запрос: "слово1 OR слово2 OR слово3"
+  const FTS5_RESERVED = new Set(['AND', 'OR', 'NOT', 'NEAR']);
   const words = query
     .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .split(/\s+/)
-    .filter(w => w.length > 1);
+    .filter(w => w.length > 1 && !FTS5_RESERVED.has(w.toUpperCase()));
   if (!words.length) return getLongMem(limit);
 
-  const ftsQuery = words.join(' OR ');
+  const ftsQuery = words.map(w => `"${w}"`).join(' OR ');
 
   try {
     const results = stmtSearchLong.all(ftsQuery, limit || config.maxLongMemInContext);
@@ -180,7 +186,7 @@ function searchLongMem(keywords, limit) {
 function searchShortMem(keywords) {
   const query = String(keywords || '').trim().toLowerCase();
   if (!query) return [];
-  const words = query.split(/\s+/).filter(w => w.length > 1);
+  const words = query.split(/\s+/).filter(w => w.length >= 3);
   if (!words.length) return [];
   
   const allShort = getShortMem(100);
@@ -190,6 +196,7 @@ function searchShortMem(keywords) {
   });
 }
 
+
 /**
  * Получить записи по массиву ID (ищет и в short_mem, и в long_mem).
  */
@@ -197,18 +204,23 @@ function getRecordsByIds(ids) {
   if (!ids || ids.length === 0) return [];
   const results = [];
   for (const id of ids) {
-    const numId = Number(id);
+    const strId = String(id).toUpperCase();
+    const isLong = strId.startsWith('L');
+    const numId = Number(strId.replace(/[SL]/g, ''));
     if (!Number.isFinite(numId)) continue;
-    let rec = stmtGetShortById.get(numId);
-    if (rec) {
-      rec.memory_type = 'short';
-      results.push(rec);
-      continue;
-    }
-    rec = stmtGetLongById.get(numId);
-    if (rec) {
-      rec.memory_type = 'long';
-      results.push(rec);
+    
+    if (isLong) {
+      const rec = stmtGetLongById.get(numId);
+      if (rec) {
+        rec.memory_type = 'long';
+        results.push(rec);
+      }
+    } else {
+      const rec = stmtGetShortById.get(numId);
+      if (rec) {
+        rec.memory_type = 'short';
+        results.push(rec);
+      }
     }
   }
   return results;
@@ -220,7 +232,45 @@ function getRecordsByIds(ids) {
  */
 function clearExpired() {
   const info = stmtClearExpired.run();
+  archiveExpiredShortMem(config.maxStmCycles);
   return info.changes;
+}
+
+function archiveExpiredShortMem(maxCycles = 4) {
+  // Ensure the 'cycles' column exists in short_mem
+  try {
+    db.exec('ALTER TABLE short_mem ADD COLUMN cycles INTEGER DEFAULT 0');
+  } catch (_) {
+    // Column already exists, safe to ignore
+  }
+
+  try {
+    // Increment cycles for all entries in short_mem
+    db.prepare('UPDATE short_mem SET cycles = cycles + 1').run();
+
+    // Select and auto-archive entries that exceeded cycles limit
+    const expired = db.prepare('SELECT * FROM short_mem WHERE cycles >= ?').all(maxCycles);
+    for (const entry of expired) {
+      addLong(
+        entry.type,
+        entry.content,
+        `auto_archive, cycle_limit_${maxCycles}, ${entry.priority || 'normal'}`,
+        `auto_archive_stm_${entry.id}`
+      );
+      deleteShort(entry.id);
+      console.log(`[MEM] Auto-archived STM #${entry.id} (${entry.type}) to LTM after ${entry.cycles} cycles.`);
+    }
+  } catch (err) {
+    console.error('[MEM] Error in STM auto-archiving:', err.message);
+  }
+}
+
+function getRandomLongMem() {
+  try {
+    return db.prepare('SELECT * FROM long_mem ORDER BY RANDOM() LIMIT 1').get();
+  } catch (_) {
+    return null;
+  }
 }
 
 /**
@@ -284,6 +334,57 @@ function initBaseAdaptations() {
   }
 }
 
+// --- Letta Block Abstraction Layer (Phase 2) ---
+
+/**
+ * Core Memory (In-context)
+ * Maps short_mem and adaptations into Letta-style blocks
+ */
+function getCoreMemoryBlocks(limit = 50) {
+  const shortMem = getShortMem(limit);
+  const adaptations = getAdaptations();
+  
+  const active_tasks = shortMem.filter(e => ['task', 'plan', 'reminder'].includes(e.type));
+  const working_context = shortMem.filter(e => ['thought', 'insight', 'question'].includes(e.type));
+  const persona = adaptations.map(a => `Rule: ${a.rule} (Target: ${a.target}, Strength: ${a.strength})`);
+  
+  return {
+    active_tasks,
+    working_context,
+    persona
+  };
+}
+
+/**
+ * Archival Memory (Out-of-context, searchable)
+ * Wraps long_mem FTS5 search
+ */
+function getArchivalMemory(query, limit = 20) {
+  if (query) {
+    return searchLongMem(query, limit);
+  }
+  return getLongMem(limit);
+}
+
+/**
+ * Recall Memory (Temporal/Event history)
+ * Reads chat_history.json
+ */
+function getRecallMemory(limit = 50) {
+  const fs = require('fs');
+  const path = require('path');
+  const chatFile = path.join(config.logDir, 'chat_history.json');
+  try {
+    if (fs.existsSync(chatFile)) {
+      const data = JSON.parse(fs.readFileSync(chatFile, 'utf8'));
+      return Array.isArray(data) ? data.slice(-limit) : [];
+    }
+  } catch (err) {
+    // Ignore read errors
+  }
+  return [];
+}
+
 module.exports = {
   addShort,
   addLong,
@@ -301,5 +402,10 @@ module.exports = {
   getAdaptations,
   challengeAdaptation,
   weakenAdaptation,
-  initBaseAdaptations
+  initBaseAdaptations,
+  archiveExpiredShortMem,
+  getRandomLongMem,
+  getCoreMemoryBlocks,
+  getArchivalMemory,
+  getRecallMemory
 };
