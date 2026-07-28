@@ -9,6 +9,7 @@ class TelegramBridge {
     this.botMessageIds = new Set();
     this.pendingUserReplies = new Map(); // msgId -> { text, user, replyToBotMsgId }
     this.reactionCounts = new Map(); // msgId -> count
+    this.userRateLimitMap = new Map(); // userId -> lastTimestamp (1 token per 2 mins per user)
     this.onUserInputCallback = null;
     this.pollingOffset = 0;
     this.isPolling = false;
@@ -177,6 +178,10 @@ class TelegramBridge {
       const text = msg.text || '';
       const replyTo = msg.reply_to_message;
       const user = msg.from.username || msg.from.first_name || 'User';
+      const userId = msg.from.id;
+      const nowMs = Date.now();
+      const lastUserTime = this.userRateLimitMap.get(userId) || 0;
+      const TWO_MINUTES_MS = 2 * 60 * 1000;
 
       if (replyTo) {
         this.pendingUserReplies.set(msg.message_id, {
@@ -189,16 +194,29 @@ class TelegramBridge {
 
       const isReplyToBot = replyTo && replyTo.from && (replyTo.from.id === msg.from.id || replyTo.from.is_bot);
       const isReplyToQuestion = isReplyToBot && replyTo.text && replyTo.text.includes('?');
+      const isUserTokenAvailable = (nowMs - lastUserTime) >= TWO_MINUTES_MS;
 
-      // Проверка Вопросительной Квоты ИЛИ прямого ответа на сообщение с вопросом '?'
-      if ((this.questionQuota > 0 || isReplyToQuestion || !replyTo) && text.trim()) {
-        if (this.questionQuota > 0) this.questionQuota -= 1;
-        console.log(`[TELEGRAM GATE] ✅ Ответ пропущен в контекст от @${user}: "${text}"`);
+      // Шлюз 1: Персональный 2-минутный токен пользователя
+      if (isUserTokenAvailable && text.trim()) {
+        this.userRateLimitMap.set(userId, nowMs);
+        console.log(`[TELEGRAM GATE] 🎟️ Персональный 2-мин токен пользователя @${user} использован: "${text}"`);
         if (this.onUserInputCallback) {
           this.onUserInputCallback(`[Telegram @${user}]: ${text}`);
         }
         return;
       }
+
+      // Шлюз 2: Проверка Вопросительной Квоты ИЛИ прямого ответа на сообщение с вопросом '?'
+      if ((this.questionQuota > 0 || isReplyToQuestion) && text.trim()) {
+        if (this.questionQuota > 0) this.questionQuota -= 1;
+        console.log(`[TELEGRAM GATE] ❓ Ответ пропущен по квоте вопроса от @${user}: "${text}"`);
+        if (this.onUserInputCallback) {
+          this.onUserInputCallback(`[Telegram @${user}]: ${text}`);
+        }
+        return;
+      }
+
+      // Шлюз 3: Ожидание 3+ реакций (отработка в processReactionGate)
     }
 
     // 2. Реакция на сообщение (message_reaction или message_reaction_count)
