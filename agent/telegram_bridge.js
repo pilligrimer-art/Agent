@@ -159,6 +159,11 @@ class TelegramBridge {
       const replyTo = msg.reply_to_message;
       const user = msg.from ? (msg.from.username || msg.from.first_name) : 'User';
 
+      if (!this.chatId && msg.chat) {
+        this.chatId = String(msg.chat.id);
+        console.log(`[TELEGRAM] ✅ Авто-определение Chat ID: ${this.chatId}`);
+      }
+
       if (replyTo) {
         this.pendingUserReplies.set(msg.message_id, {
           text,
