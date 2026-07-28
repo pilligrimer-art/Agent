@@ -93,6 +93,26 @@ function formatLongEntry(entry) {
   return `[#L${entry.id} | type:${entry.type} | tags:${entry.tags || 'none'} | h:${getShortHash(entry.content)}] keywords: ${getKeywords(entry.content)}`;
 }
 
+function getTopThoughtKeyword(thoughtHistory) {
+  if (!thoughtHistory || thoughtHistory.length === 0) return null;
+  const recentThoughts = thoughtHistory.slice(-3).join(' ');
+  const clean = recentThoughts.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, ' ').replace(/\s+/g, ' ');
+  const words = clean.split(' ').filter(w => w.length > 3 && !STOP_WORDS.has(w));
+  if (words.length === 0) return null;
+  
+  const counts = {};
+  let maxWord = null;
+  let maxCount = 0;
+  for (const w of words) {
+    counts[w] = (counts[w] || 0) + 1;
+    if (counts[w] > maxCount) {
+      maxCount = counts[w];
+      maxWord = w;
+    }
+  }
+  return maxWord;
+}
+
 function extractKeywords(shortEntries) {
   return shortEntries
     .map(e => e.content)
@@ -146,6 +166,16 @@ function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseEr
   const adaptBlock = adaptations.length > 0
     ? adaptations.map(a => `- [${a.id}] ${a.target}: ${a.rule} ${a.challenge_count > 0 ? `(chal:${a.challenge_count})` : ''}`).join('\n')
     : '(no active adaptations)';
+
+  // Mechanical Memory Tool (Auto-Focus based on recent thoughts)
+  let autoFocusBlock = '';
+  const topKeyword = getTopThoughtKeyword(thoughtHistory);
+  if (topKeyword) {
+    const autoFocusResults = mem.searchLongMem(topKeyword, 3);
+    if (autoFocusResults.length > 0) {
+      autoFocusBlock = `[AUTO-ASSOCIATIONS: "${topKeyword}"]\nThese memories surfaced automatically based on your recent thoughts. You don't need to manually focus on them if they are useful:\n${autoFocusResults.map(formatLongEntry).join('\n')}\n\n`;
+    }
+  }
 
   // Focused Memory
   const focusedRecords = mem.getRecordsByIds(focusIds);
@@ -288,7 +318,7 @@ ${shortBlock}
 Your long-term memory is your shelf. Move everything from short-term memory here that is completed, thought over, or just want to keep for a long time. Do not be afraid to write here frequently.
 ${longBlock}
 
-${focusBlock}${scentBlock}[WORKING CONTEXT (Tail of previous thought)]
+${focusBlock}${autoFocusBlock}${scentBlock}[WORKING CONTEXT (Tail of previous thought)]
 ${historyBlock}${messagesBlock}
 
 [CURRENT TIME]
