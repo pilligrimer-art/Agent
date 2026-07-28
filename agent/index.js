@@ -5,6 +5,20 @@ const config = require('./config');
 require('./db'); // инициализация БД при загрузке (синхронно)
 const mem = require('./memory_manager');
 const { buildContext, getReducedSnippet } = require('./context_builder');
+
+const skillsDir = path.join(__dirname, '..', 'skills');
+const loadedSkills = {};
+try {
+  if (fs.existsSync(skillsDir)) {
+    const files = fs.readdirSync(skillsDir).filter(f => f.endsWith('.js'));
+    for (const file of files) {
+      const skill = require(path.join(skillsDir, file));
+      if (skill.tag) loadedSkills[skill.tag] = skill;
+    }
+  }
+} catch (e) { console.error('Failed to load skills:', e); }
+
+// --- Состояние сессии ---
 const { parseOutput, logTelemetry } = require('./output_parser');
 const { scheduleNext, runSafely, clearScheduledRun, getSchedulerState } = require('./scheduler');
 
@@ -231,7 +245,7 @@ function writeSessionLog(data) {
 }
 
 // --- Выполнение команд из парсинга ---
-function executeActions(parsed, feedback) {
+async function executeActions(parsed, feedback) {
   const results = { saved: 0, deleted: 0, adapts: 0, challenges: 0, weakens: 0, errors: [], blocked: 0 };
 
   // Сохранения
@@ -319,6 +333,29 @@ function executeActions(parsed, feedback) {
     } catch (err) {
       results.blocked++;
       logTelemetry('action.failed', { intent: 'MEM_ADAPT_WEAKEN', error: err.message });
+    }
+  }
+
+  // Dynamic Skills
+  if (parsed.dynamicSkills) {
+    for (const ds of parsed.dynamicSkills) {
+      try {
+        const skill = loadedSkills[ds.intent];
+        if (skill && typeof skill.execute === 'function') {
+          const res = await skill.execute(ds.payload, memState);
+          if (res.success) {
+            feedback.executed.push({ intent: ds.intent, summary: res.log || 'Executed successfully' });
+          } else {
+            results.errors.push(`SKILL ${ds.intent}: ${res.log}`);
+            results.blocked++;
+            logTelemetry('action.failed', { intent: ds.intent, error: res.log });
+          }
+        }
+      } catch (err) {
+        results.errors.push(`SKILL ${ds.intent}: ${err.message}`);
+        results.blocked++;
+        logTelemetry('action.failed', { intent: ds.intent, error: err.message });
+      }
     }
   }
 
@@ -419,7 +456,7 @@ async function runAgent() {
 
     parsed = parseOutput(response);
     const feedback = parsed.feedback;
-    const results = executeActions(parsed, feedback);
+    const results = await executeActions(parsed, feedback);
     console.log(`[AGENT] Сохранено: ${results.saved}, удалено: ${results.deleted}`);
     
     memState.totalRuns++;

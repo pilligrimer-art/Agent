@@ -12,6 +12,27 @@ try {
   console.error("Failed to load tool_help.json", e);
 }
 
+const skillsDir = path.join(__dirname, '..', 'skills');
+try {
+  if (fs.existsSync(skillsDir)) {
+    const files = fs.readdirSync(skillsDir).filter(f => f.endsWith('.js'));
+    for (const file of files) {
+      const skill = require(path.join(skillsDir, file));
+      if (skill.tag) {
+        toolHelp[skill.tag] = {
+          purpose: skill.description,
+          exact_syntax: skill.syntax,
+          valid_example: skill.example,
+          common_mistake: "Invalid JSON payload.",
+          related_tool_if_confused: "N/A"
+        };
+      }
+    }
+  }
+} catch (e) {
+  console.error("Failed to load dynamic skills for context", e);
+}
+
 function trimThought(t) {
   if (t.length <= 3000) return t;
   return t.slice(0, 1000) + '\n... [TRUNCATED] ...\n' + t.slice(-1500);

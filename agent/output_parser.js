@@ -2,6 +2,18 @@ const fs = require('fs');
 const path = require('path');
 const config = require('./config');
 
+const skillsDir = path.join(__dirname, '..', 'skills');
+let dynamicTags = [];
+try {
+  if (fs.existsSync(skillsDir)) {
+    const files = fs.readdirSync(skillsDir).filter(f => f.endsWith('.js'));
+    for (const file of files) {
+      const skill = require(path.join(skillsDir, file));
+      if (skill.tag) dynamicTags.push(skill.tag);
+    }
+  }
+} catch (e) { console.error('Failed to load dynamic tags:', e); }
+
 const PARSE_ERRORS_LOG = path.join(config.logDir, 'parse_errors.log');
 
 function logTelemetry(event, meta = {}) {
@@ -538,6 +550,7 @@ function parseOutput(text) {
     parseErrorCount: 0,
     repairedCount: 0,
     scheduleSecParsed: false,
+    dynamicSkills: [],
     feedback: {
       executed: [],
       failed: [],
@@ -560,7 +573,9 @@ function parseOutput(text) {
   };
 
   const commandRanges = [];
-  const RE_ANY_TAG = /\[(MEM_SAVE|MEM_DELETE|MEM_FOCUS|MEM_ADAPT_CHALLENGE|MEM_ADAPT_WEAKEN|MEM_ADAPT|SCHEDULE|REFLECT|SEND_MESSAGE|HELP_ACTION|HELP_ACTIONS)\b([^\]]*)\]/gi;
+  const coreTags = ['MEM_SAVE','MEM_DELETE','MEM_FOCUS','MEM_ADAPT_CHALLENGE','MEM_ADAPT_WEAKEN','MEM_ADAPT','SCHEDULE','REFLECT','SEND_MESSAGE','HELP_ACTION','HELP_ACTIONS'];
+  const allTags = Array.from(new Set([...coreTags, ...dynamicTags]));
+  const RE_ANY_TAG = new RegExp(`\\[(${allTags.join('|')})\\b([^\\]]*)\\]`, 'gi');
 
   let match;
   while ((match = RE_ANY_TAG.exec(normalized)) !== null) {
@@ -783,6 +798,28 @@ function parseOutput(text) {
       if (actionName) {
         addHelp(actionName.trim().toUpperCase());
         logTelemetry('parser.help_requested', { scope: actionName.trim().toUpperCase() });
+      }
+    }
+    
+    else {
+      if (dynamicTags.includes(intent)) {
+        const startBrace = combinedArgs.indexOf('{');
+        let payload = {};
+        let parseOk = false;
+        if (startBrace >= 0) {
+          const parsed = safeParseJson(combinedArgs.substring(startBrace));
+          if (parsed.ok) {
+            payload = parsed.value;
+            parseOk = true;
+          }
+        }
+        if (parseOk) {
+          actions.dynamicSkills.push({ intent, payload });
+          logTelemetry('parser.valid_action', { intent });
+        } else {
+          addFailed(intent, observed, 'Invalid JSON payload', `[${intent}] {"key": "value"}`);
+          actions.parseErrorCount++;
+        }
       }
     }
   }
