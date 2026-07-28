@@ -54,5 +54,19 @@
     "valid_example": "[MEM_ADAPT_WEAKEN] {\"id\":\"bio_1\",\"why\":\"No longer primary focus.\",\"amount\":0.2}",
     "common_mistake": "Amount should be a decimal like 0.2. Do not use percentages.",
     "related_tool_if_confused": "If you want to replace it entirely, use [MEM_ADAPT_CHALLENGE]"
+  },
+  "MCP_LIST": {
+    "purpose": "List files inside a specific directory in the workspace.",
+    "exact_syntax": "[MCP_LIST \"dir_name\"]",
+    "valid_example": "[MCP_LIST \"docs\"]",
+    "common_mistake": "Do not request paths outside of your workspace sandbox.",
+    "related_tool_if_confused": "If you want to read a specific file, use [MCP_READ]"
+  },
+  "MCP_READ": {
+    "purpose": "Read the contents of a specific file in the workspace.",
+    "exact_syntax": "[MCP_READ \"file_name.txt\"]",
+    "valid_example": "[MCP_READ \"config.json\"]",
+    "common_mistake": "Do not request paths outside of your workspace sandbox.",
+    "related_tool_if_confused": "If you want to see what files exist, use [MCP_LIST]"
   }
 }

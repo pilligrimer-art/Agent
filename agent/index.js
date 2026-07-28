@@ -4,6 +4,7 @@ const axios = require('axios');
 const config = require('./config');
 require('./db'); // инициализация БД при загрузке (синхронно)
 const mem = require('./memory_manager');
+const tools = require('./tools');
 const { buildContext, getReducedSnippet } = require('./context_builder');
 
 const skillsDir = path.join(__dirname, '..', 'skills');
@@ -334,6 +335,17 @@ async function executeActions(parsed, feedback) {
       results.blocked++;
       logTelemetry('action.failed', { intent: 'MEM_ADAPT_WEAKEN', error: err.message });
     }
+  }
+
+  // MCP Tools
+  for (const path of (parsed.mcpLists || [])) {
+    const result = tools.mcpList(path);
+    feedback.executed.push({ intent: 'MCP_LIST', summary: `Listed ${path}`, output: result });
+  }
+
+  for (const path of (parsed.mcpReads || [])) {
+    const result = tools.mcpRead(path);
+    feedback.executed.push({ intent: 'MCP_READ', summary: `Read ${path}`, output: result });
   }
 
   // Dynamic Skills

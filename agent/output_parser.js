@@ -542,6 +542,8 @@ function parseOutput(text) {
     adaptChallenges: [],
     adaptWeakens: [],
     messages: [],
+    mcpLists: [],
+    mcpReads: [],
     helpRequests: [],
     focusIds: [],
     focusTopics: [],
@@ -573,7 +575,7 @@ function parseOutput(text) {
   };
 
   const commandRanges = [];
-  const coreTags = ['MEM_SAVE','MEM_DELETE','MEM_FOCUS','MEM_ADAPT_CHALLENGE','MEM_ADAPT_WEAKEN','MEM_ADAPT','SCHEDULE','REFLECT','SEND_MESSAGE','HELP_ACTION','HELP_ACTIONS'];
+  const coreTags = ['MEM_SAVE','MEM_DELETE','MEM_FOCUS','MEM_ADAPT_CHALLENGE','MEM_ADAPT_WEAKEN','MEM_ADAPT','SCHEDULE','REFLECT','SEND_MESSAGE','HELP_ACTION','HELP_ACTIONS','MCP_LIST','MCP_READ'];
   const allTags = Array.from(new Set([...coreTags, ...dynamicTags]));
   const RE_ANY_TAG = new RegExp(`\\[(${allTags.join('|')})\\b([^\\]]*)\\]`, 'gi');
 
@@ -784,6 +786,24 @@ function parseOutput(text) {
       } else {
         addFailed('SEND_MESSAGE', observed, 'empty_tag', SUGGESTED.SEND_MESSAGE);
         addHelp('SEND_MESSAGE');
+      }
+    }
+    
+    else if (intent === 'MCP_LIST') {
+      const matchPath = combinedArgs.match(/"([^"]+)"|'([^']+)'|(\S+)/);
+      const targetPath = matchPath ? (matchPath[1] || matchPath[2] || matchPath[3] || '').trim() : '';
+      actions.mcpLists.push(targetPath);
+      logTelemetry('parser.valid_action', { intent: 'MCP_LIST', path: targetPath });
+    }
+
+    else if (intent === 'MCP_READ') {
+      const matchPath = combinedArgs.match(/"([^"]+)"|'([^']+)'|(\S+)/);
+      const targetPath = matchPath ? (matchPath[1] || matchPath[2] || matchPath[3] || '').trim() : '';
+      if (targetPath) {
+        actions.mcpReads.push(targetPath);
+        logTelemetry('parser.valid_action', { intent: 'MCP_READ', path: targetPath });
+      } else {
+        addFailed('MCP_READ', observed, 'missing_path', '[MCP_READ "file_name.txt"]');
       }
     }
 
