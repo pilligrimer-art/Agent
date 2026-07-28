@@ -516,6 +516,17 @@ async function runAgent() {
         memState.chatHistory.push({ sender: 'agent', time: new Date().toISOString(), text: msgText });
         console.log(`[AGENT -> USER] ${msgText}`);
         telegramBridge.sendMessage(msgText);
+
+        // Таймер ожидания ответа при вопросах пользователю (1 мин минимально, 2 мин если знаков препинания > 2)
+        if (msgText.includes('?')) {
+          const punctuationCount = (msgText.match(/[\p{P}]/gu) || []).length;
+          const questionTimerSec = punctuationCount > 2 ? 120 : 60;
+          if (!parsed.scheduleSecParsed || parsed.scheduleSec < questionTimerSec) {
+            parsed.scheduleSec = questionTimerSec;
+            parsed.scheduleSecParsed = true;
+            console.log(`[SCHEDULER] ⏱️ Вопрос пользователю. Задан таймер: ${questionTimerSec}с (знаков препинания: ${punctuationCount}).`);
+          }
+        }
       }
       saveChatHistory();
     }
