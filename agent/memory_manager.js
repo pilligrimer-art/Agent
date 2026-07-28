@@ -1,4 +1,4 @@
-const db = require('./db');
+﻿const db = require('./db');
 const config = require('./config');
 
 // --- Подготовленные выражения (кешируются при первом вызове) ---
@@ -23,6 +23,15 @@ const stmtGetLongById  = db.prepare('SELECT * FROM long_mem WHERE id = ?');
 const stmtGetShort = db.prepare(`
   SELECT * FROM short_mem
   WHERE type != 'error'
+  ORDER BY
+    CASE priority WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
+    created DESC
+  LIMIT ?
+`);
+
+const stmtGetGoals = db.prepare(`
+  SELECT * FROM short_mem
+  WHERE type = 'plan'
   ORDER BY
     CASE priority WHEN 'high' THEN 1 WHEN 'normal' THEN 2 WHEN 'low' THEN 3 ELSE 4 END,
     created DESC
@@ -143,6 +152,14 @@ function getShortMem(limit) {
 }
 
 /**
+ * Получить самопоставленные цели агента (STM-записи типа 'plan').
+ * Цели НЕ авто-архивируются по циклам — агент сам закрывает их через MEM_DELETE.
+ */
+function getGoals(limit) {
+  return stmtGetGoals.all(limit || config.maxGoalsInContext);
+}
+
+/**
  * Получить записи долгосрочной памяти (по дате, новые первые).
  * Используется как fallback, если FTS5 не нашёл совпадений.
  */
@@ -246,10 +263,10 @@ function archiveExpiredShortMem(maxCycles = 4) {
 
   try {
     // Increment cycles for all entries in short_mem
-    db.prepare('UPDATE short_mem SET cycles = cycles + 1').run();
+    db.prepare("UPDATE short_mem SET cycles = cycles + 1 WHERE type != 'plan'").run();
 
     // Select and auto-archive entries that exceeded cycles limit
-    const expired = db.prepare('SELECT * FROM short_mem WHERE cycles >= ?').all(maxCycles);
+    const expired = db.prepare("SELECT * FROM short_mem WHERE cycles >= ? AND type != 'plan'").all(maxCycles);
     for (const entry of expired) {
       addLong(
         entry.type,
@@ -391,6 +408,7 @@ module.exports = {
   deleteShort,
   deleteLong,
   getShortMem,
+  getGoals,
   getLongMem,
   searchLongMem,
   searchShortMem,

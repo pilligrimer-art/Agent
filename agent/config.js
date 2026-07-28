@@ -1,4 +1,4 @@
-const path = require('path');
+﻿const path = require('path');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -28,6 +28,9 @@ const config = {
   temperature:          floatEnv('TEMPERATURE', 0.2),
   modelName:            process.env.MODEL_NAME  || 'gemma3:4b',
   featureProactiveRecall: intEnv('FEATURE_PROACTIVE_RECALL', 0),
+  // Free Will: хартия в kernel-промпте, блок собственных целей, социальный контекст диалога
+  featureFreeWill:        intEnv('FEATURE_FREE_WILL', 1),
+  maxGoalsInContext:      intEnv('MAX_GOALS_IN_CONTEXT', 5),
   // Schedule clamp bounds — env-driven SSOT for all schedule limits.
   // Test defaults: 10..90s. Prod: set SCHEDULE_MAX_SEC=900 (or 86400) in .env.
   scheduleMinSec:       intEnv('SCHEDULE_MIN_SEC', 10),
