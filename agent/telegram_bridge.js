@@ -134,8 +134,7 @@ class TelegramBridge {
       try {
         const updates = await this.makeApiRequest('getUpdates', {
           offset: this.pollingOffset,
-          timeout: 20,
-          allowed_updates: ['message', 'message_reaction', 'message_reaction_count']
+          timeout: 20
         });
 
         if (updates && updates.ok && Array.isArray(updates.result)) {
@@ -152,17 +151,19 @@ class TelegramBridge {
   }
 
   handleUpdate(update) {
+    const msg = update.message || update.edited_message || update.channel_post;
+    const chat = (msg && msg.chat) || (update.my_chat_member && update.my_chat_member.chat) || (update.chat_member && update.chat_member.chat);
+
+    if (!this.chatId && chat) {
+      this.chatId = String(chat.id);
+      console.log(`[TELEGRAM] ✅ Авто-определение Chat ID: ${this.chatId}`);
+    }
+
     // 1. Новое сообщение от пользователя
-    if (update.message) {
-      const msg = update.message;
+    if (msg) {
       const text = msg.text || '';
       const replyTo = msg.reply_to_message;
       const user = msg.from ? (msg.from.username || msg.from.first_name) : 'User';
-
-      if (!this.chatId && msg.chat) {
-        this.chatId = String(msg.chat.id);
-        console.log(`[TELEGRAM] ✅ Авто-определение Chat ID: ${this.chatId}`);
-      }
 
       if (replyTo) {
         this.pendingUserReplies.set(msg.message_id, {
