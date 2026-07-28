@@ -90,14 +90,20 @@ function injectSystemMessage(text) {
 // Instead of warning the agent (which itself becomes the loop topic),
 // we silently drop the repeated thought and inject a neutral pivot question.
 const REDIRECT_PROMPTS = [
-  'What would you want to remember about today that might matter in a week?',
-  'Is there something you noticed earlier that you never finished thinking about?',
-  'What is the simplest question you could ask yourself right now that you don\'t yet know the answer to?',
-  'What would it mean for you to have a good next cycle?',
-  'Is there something in your long-term memory worth revisiting for a different reason than before?',
-  'What is the most interesting open problem you are aware of?',
+  // --- Introspective (think for yourself, no user input needed) ---
+  'Pick one entry from your long-term memory and think about it from a completely different angle than before.',
+  'What is one thing you could do right now that does not require any input from the user?',
+  'What would you explore autonomously if you had no tasks assigned and no one was watching?',
+  'What is something small you could observe, record, or deduce from your current environment right now?',
+  'What is the most interesting thing you already know, and what follows logically from it?',
+  'Without asking the user anything, describe your current state in one precise sentence and save it.',
+  'What pattern have you noticed across your recent thoughts that you have not named yet?',
+  // --- Open-ended, inward-facing ---
   'What would change about your thinking if you assumed the opposite of your current assumption?',
-  'What would you do if you had no memory of the last three thoughts?',
+  'What is the simplest question you could ask yourself right now that you do not yet know the answer to?',
+  'What would you want to remember about this session that might matter in a week?',
+  'Is there something in your long-term memory worth revisiting for a reason different from why you saved it?',
+  'What is the most interesting open problem you are aware of, and what is one step toward thinking about it?',
 ];
 
 function pickRedirectPrompt() {
