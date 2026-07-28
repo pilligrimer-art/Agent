@@ -851,6 +851,20 @@ function parseOutput(text) {
   }
   clearText = clearText.replace(/\s+/g, ' ').trim();
 
+  // Extract SELF_QUESTION and TOPIC_SCORE
+  actions.selfQuestion = null;
+  actions.topicScore = null;
+
+  const scoreMatch = normalized.match(/\[?TOPIC_SCORE[:\s]+(\d+)/i) || normalized.match(/topic\s*score[:\s]+(\d+)/i);
+  if (scoreMatch) {
+    actions.topicScore = Math.min(10, Math.max(1, parseInt(scoreMatch[1], 10)));
+  }
+
+  const qMatch = normalized.match(/\[SELF_QUESTION\s+["']?([^\]"'\n]+)["']?\]/i) || normalized.match(/\[SELF_QUESTION\]\s*:?\s*([^\n]+)/i);
+  if (qMatch) {
+    actions.selfQuestion = qMatch[1].trim();
+  }
+
   // ========== HALLUCINATION PATTERN DETECTOR ==========
   // Runs on `normalized` (original text before tag-stripping) so it sees everything
   // that the main RE_ANY_TAG pass already handled, but only fires on spans NOT already

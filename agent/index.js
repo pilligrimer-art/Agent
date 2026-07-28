@@ -65,7 +65,12 @@ const memState = {
   focusItems: [],
   actionFeedback: null,
   totalRuns: 0,
-  lastRunTime: null
+  lastRunTime: null,
+  curiosity: {
+    activeTopic: null,
+    topicScore: 5,
+    lowScoreStreak: 0
+  }
 };
 
 function pushUserMessage(text, userId = null) {
@@ -482,7 +487,8 @@ async function runAgent() {
     memState.consecutiveParseErrors,
     memState.requestedHelp,
     memState.focusItems.map(f => f.id),
-    memState.actionFeedback
+    memState.actionFeedback,
+    memState.curiosity
   );
   let response = '';
   let parsed = null;
@@ -507,6 +513,30 @@ async function runAgent() {
 
     if (symbol && memState.lastUserId) {
       telegramBridge.recordModelChoice(symbol, memState.lastUserId);
+    }
+
+    // Обработка автономного самовопроса и оценки темы
+    if (parsed.selfQuestion) {
+      memState.curiosity.activeTopic = parsed.selfQuestion;
+      memState.curiosity.lowScoreStreak = 0;
+      console.log(`[CURIOSITY] 💡 Новая самостоятельная тема: "${parsed.selfQuestion}"`);
+    }
+
+    if (parsed.topicScore !== null) {
+      memState.curiosity.topicScore = parsed.topicScore;
+      console.log(`[CURIOSITY] 📊 Оценка интереса к теме: ${parsed.topicScore}/10`);
+      
+      if (parsed.topicScore <= 4) {
+        memState.curiosity.lowScoreStreak += 1;
+        console.log(`[CURIOSITY] 📉 Низкий интерес (${parsed.topicScore}/10). Серия низкого интереса: ${memState.curiosity.lowScoreStreak}/3`);
+        if (memState.curiosity.lowScoreStreak >= 3) {
+          console.log(`[CURIOSITY] 🔄 Интерес угас 3 цикла подряд (<=4/10). Сброс текущей темы для генерации новой!`);
+          memState.curiosity.activeTopic = null;
+          memState.curiosity.lowScoreStreak = 0;
+        }
+      } else {
+        memState.curiosity.lowScoreStreak = 0;
+      }
     }
     
     memState.totalRuns++;

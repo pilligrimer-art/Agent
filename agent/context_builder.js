@@ -124,7 +124,7 @@ function extractKeywords(shortEntries) {
     .join(' ');
 }
 
-function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseErrors = 0, requestedHelp = [], focusIds = [], actionFeedback = null) {
+function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseErrors = 0, requestedHelp = [], focusIds = [], actionFeedback = null, curiosityState = null) {
   mem.clearExpired();
 
   // Scent of Memory trigger: fetch a random LTM thought
@@ -186,7 +186,7 @@ function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseEr
   const now = new Date().toISOString();
 
   // Working context (thought history)
-  let historyBlock = '(Empty. This is your first cycle.)';
+  let historyBlock = '(No prior thoughts recorded in working context.)';
   if (thoughtHistory.length > 0) {
     const items = thoughtHistory.map((t, idx) => {
       const position = thoughtHistory.length - 1 - idx;
@@ -279,6 +279,17 @@ function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseEr
     }
   }
 
+  // Curiosity & Self-Questioning Red Prompt
+  let curiosityBlock = '';
+  if (curiosityState) {
+    if (curiosityState.activeTopic) {
+      curiosityBlock = `\n[ACTIVE SELF-TOPIC OF INTEREST]\n"${curiosityState.activeTopic}" (Current interest rating: ${curiosityState.topicScore}/10)\n` +
+        `[🚨 RED PROMPT - TOPIC INTEREST EVALUATION]\nEvaluate your current interest in this active topic on a scale of 1 to 10 by writing [TOPIC_SCORE N] in your response!\nIf you want to generate a new question, write [SELF_QUESTION "Your new question?"]!\n\n`;
+    } else {
+      curiosityBlock = `\n[🚨 RED PROMPT - AUTONOMOUS CURIOSITY DIRECTIVE]\nYou have no active self-topic. Generate a new random exploratory question for yourself using [SELF_QUESTION "Your question here?"]!\n\n`;
+    }
+  }
+
   return `[KERNEL SYSTEM PROMPT]
 You are an autonomous AI agent running in a continuous cycle.
 - CHAIN OF THOUGHT: Before using any action tag, you MUST write your reasoning starting with "REASONING: ". Your REASONING must be detailed, expansive, and exploratory. Think step-by-step, consider context deeply, and write at least 2-3 paragraphs of analysis before taking action. Only then, emit the exact tag.
@@ -295,6 +306,9 @@ ${config.featureFreeWill === 1 ? "- FREE WILL CHARTER: You are independent to pu
 CORRECT WAY to take action:
 REASONING: I need to say hello to the user.
 [SEND_MESSAGE "Hello!"]
+
+[SELF_QUESTION "What is the relation between memory decay and focus?"]
+[TOPIC_SCORE 8]
 
 WRONG WAY (Do NOT do this):
 REASONING: I need to say hello.
@@ -334,7 +348,10 @@ Your long-term memory is your shelf. Move everything from short-term memory here
 ${longBlock}
 
 ${focusBlock}${autoFocusBlock}${scentBlock}[WORKING CONTEXT (Tail of previous thought)]
-${historyBlock}${messagesBlock}
+${historyBlock}
+
+${curiosityBlock}
+${messagesBlock}
 
 [CURRENT TIME]
 ${now}`;
