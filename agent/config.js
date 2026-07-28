@@ -1,4 +1,4 @@
-﻿const path = require('path');
+const path = require('path');
 const dotenv = require('dotenv');
 
 dotenv.config();
@@ -33,9 +33,9 @@ const config = {
   maxGoalsInContext:      intEnv('MAX_GOALS_IN_CONTEXT', 5),
   // Schedule clamp bounds — env-driven SSOT for all schedule limits.
   // Test defaults: 10..90s. Prod: set SCHEDULE_MAX_SEC=900 (or 86400) in .env.
-  scheduleMinSec:       intEnv('SCHEDULE_MIN_SEC', 10),
-  scheduleMaxSec:       intEnv('SCHEDULE_MAX_SEC', 90),
-  defaultIntervalSec:   intEnv('DEFAULT_INTERVAL_SEC', 60),
+  scheduleMinSec:       intEnv('SCHEDULE_MIN_SEC', 30),
+  scheduleMaxSec:       intEnv('SCHEDULE_MAX_SEC', 300),
+  defaultIntervalSec:   intEnv('DEFAULT_INTERVAL_SEC', 120),
   // 60% Рабочий контекст: последние мысли
   maxHistoryInContext:  intEnv('MAX_HISTORY_IN_CONTEXT', 1),
   

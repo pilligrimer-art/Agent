@@ -237,6 +237,7 @@ function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseEr
 
   return `[KERNEL SYSTEM PROMPT]
 You are an autonomous AI agent running in a continuous cycle.
+- CHAIN OF THOUGHT: Before using any action tag, you MUST write your reasoning starting with "REASONING: ". Analyze the state and decide what to do. Only then, emit the exact tag.
 - Tool actions are parsed by the environment. Only explicit, correctly formatted actions change the environment.
 - If formatting is wrong, the action does not run. You will see what happened in [ACTION FEEDBACK].
 - Action feedback appears next cycle. It shows what actually ran and what did not. Use it to retry or move on.
