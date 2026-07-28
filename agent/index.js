@@ -68,8 +68,11 @@ const memState = {
   lastRunTime: null
 };
 
-function pushUserMessage(text) {
-  const msg = { sender: 'user', time: new Date().toISOString(), text };
+function pushUserMessage(text, userId = null) {
+  if (userId) {
+    memState.lastUserId = userId;
+  }
+  const msg = { sender: 'user', time: new Date().toISOString(), text, userId };
   memState.pendingMessages.push(msg);
   memState.chatHistory.push(msg);
   saveChatHistory();
@@ -495,6 +498,19 @@ async function runAgent() {
     const feedback = parsed.feedback;
     const results = await executeActions(parsed, feedback);
     console.log(`[AGENT] Сохранено: ${results.saved}, удалено: ${results.deleted}`);
+
+    // Детекция символа выбора модели '+' или '-' при сообщении пользователя
+    const choiceTarget = (parsed.messages && parsed.messages.length > 0) ? parsed.messages[0] : parsed.thought;
+    if (choiceTarget) {
+      const trimmed = choiceTarget.trim();
+      let symbol = null;
+      if (trimmed.startsWith('+')) symbol = '+';
+      else if (trimmed.startsWith('-')) symbol = '-';
+
+      if (symbol && memState.lastUserId) {
+        telegramBridge.recordModelChoice(symbol, memState.lastUserId);
+      }
+    }
     
     memState.totalRuns++;
     memState.lastRunTime = new Date().toISOString();

@@ -10,6 +10,7 @@ class TelegramBridge {
     this.pendingUserReplies = new Map(); // msgId -> { text, user, replyToBotMsgId }
     this.reactionCounts = new Map(); // msgId -> count
     this.userRateLimitMap = new Map(); // userId -> lastTimestamp (1 token per 2 mins per user)
+    this.userStreakMap = new Map(); // userId -> { plusStreak, minusStreak, cooldownUntil, bonusTokens }
     this.onUserInputCallback = null;
     this.pollingOffset = 0;
     this.isPolling = false;
@@ -180,8 +181,15 @@ class TelegramBridge {
       const user = msg.from.username || msg.from.first_name || 'User';
       const userId = msg.from.id;
       const nowMs = Date.now();
-      const lastUserTime = this.userRateLimitMap.get(userId) || 0;
-      const TWO_MINUTES_MS = 2 * 60 * 1000;
+
+      let streakState = this.userStreakMap.get(userId) || { plusStreak: 0, minusStreak: 0, cooldownUntil: 0, bonusTokens: 0 };
+
+      // Проверка 5-минутного бана после 3-х минусов подряд
+      if (streakState.cooldownUntil > nowMs) {
+        const remainingSec = Math.ceil((streakState.cooldownUntil - nowMs) / 1000);
+        console.log(`[TELEGRAM GATE] ⛔ Сообщение от @${user} заблокировано (активен 5-мин бан после 3-х минусов, осталось ${remainingSec}с).`);
+        return;
+      }
 
       if (replyTo) {
         this.pendingUserReplies.set(msg.message_id, {
@@ -192,6 +200,19 @@ class TelegramBridge {
         });
       }
 
+      // Проверка Бонусных Токенов (после 3-х плюсов подряд)
+      if (streakState.bonusTokens > 0 && text.trim()) {
+        streakState.bonusTokens -= 1;
+        this.userStreakMap.set(userId, streakState);
+        console.log(`[TELEGRAM GATE] 🎁 Использован 1 Бонусный Токен от @${user} (осталось бонусов: ${streakState.bonusTokens})`);
+        if (this.onUserInputCallback) {
+          this.onUserInputCallback(`[Telegram @${user}]: ${text}`, userId);
+        }
+        return;
+      }
+
+      const lastUserTime = this.userRateLimitMap.get(userId) || 0;
+      const TWO_MINUTES_MS = 2 * 60 * 1000;
       const isReplyToBot = replyTo && replyTo.from && (replyTo.from.id === msg.from.id || replyTo.from.is_bot);
       const isReplyToQuestion = isReplyToBot && replyTo.text && replyTo.text.includes('?');
       const isUserTokenAvailable = (nowMs - lastUserTime) >= TWO_MINUTES_MS;
@@ -201,17 +222,17 @@ class TelegramBridge {
         this.userRateLimitMap.set(userId, nowMs);
         console.log(`[TELEGRAM GATE] 🎟️ Персональный 2-мин токен пользователя @${user} использован: "${text}"`);
         if (this.onUserInputCallback) {
-          this.onUserInputCallback(`[Telegram @${user}]: ${text}`);
+          this.onUserInputCallback(`[Telegram @${user}]: ${text}`, userId);
         }
         return;
       }
 
-      // Шлюз 2: Проверка Вопросительной Квоты ИЛИ прямого ответа на сообщение с вопросом '?'
+      // Шлюз 2: Проверка Вопросительной Квоты ИЛИ прямого ответа на вопрос '?'
       if ((this.questionQuota > 0 || isReplyToQuestion) && text.trim()) {
         if (this.questionQuota > 0) this.questionQuota -= 1;
         console.log(`[TELEGRAM GATE] ❓ Ответ пропущен по квоте вопроса от @${user}: "${text}"`);
         if (this.onUserInputCallback) {
-          this.onUserInputCallback(`[Telegram @${user}]: ${text}`);
+          this.onUserInputCallback(`[Telegram @${user}]: ${text}`, userId);
         }
         return;
       }
@@ -246,9 +267,40 @@ class TelegramBridge {
       console.log(`[TELEGRAM GATE] Сообщение @${reply.user} набрало ${count} реакций! Пропуск в контекст агента: "${reply.text}"`);
       this.pendingUserReplies.delete(msgId);
       if (this.onUserInputCallback) {
-        this.onUserInputCallback(`[Telegram @${reply.user} (3+ reactions)]: ${reply.text}`);
+        this.onUserInputCallback(`[Telegram @${reply.user} (3+ reactions)]: ${reply.text}`, reply.chatId);
       }
     }
+  }
+
+  recordModelChoice(symbol, userId) {
+    if (!userId) return;
+    let state = this.userStreakMap.get(userId) || { plusStreak: 0, minusStreak: 0, cooldownUntil: 0, bonusTokens: 0 };
+
+    if (symbol === '+') {
+      state.plusStreak += 1;
+      state.minusStreak = 0;
+      console.log(`[TELEGRAM GATE] ➕ Модель ответила '+' (Плюс-стрик пользователя ${userId}: ${state.plusStreak}/3)`);
+
+      if (state.plusStreak >= 3) {
+        state.plusStreak = 0;
+        state.bonusTokens += 2;
+        console.log(`[TELEGRAM GATE] 🎁 3 ПЛЮСА ПОДРЯД! Пользователю ${userId} начислено 2 бонусных токена вне очереди!`);
+        this.sendMessage(`🎁 Вы получили 3 плюса от модели подряд! Вам начислено 2 бонусных токена для вопросов вне очереди.`);
+      }
+    } else if (symbol === '-') {
+      state.minusStreak += 1;
+      state.plusStreak = 0;
+      console.log(`[TELEGRAM GATE] ➖ Модель ответила '-' (Минус-стрик пользователя ${userId}: ${state.minusStreak}/3)`);
+
+      if (state.minusStreak >= 3) {
+        state.minusStreak = 0;
+        state.cooldownUntil = Date.now() + 5 * 60 * 1000;
+        console.log(`[TELEGRAM GATE] ⛔ 3 МИНУСА ПОДРЯД! Пользователю ${userId} установлен 5-минутный бан без токенов.`);
+        this.sendMessage(`⛔ Модель ответила 3 минуса подряд. Вы получили 5 минут блокировки без токенов ответа.`);
+      }
+    }
+
+    this.userStreakMap.set(userId, state);
   }
 }
 
