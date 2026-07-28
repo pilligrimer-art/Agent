@@ -5,6 +5,7 @@ const config = require('./config');
 require('./db'); // инициализация БД при загрузке (синхронно)
 const mem = require('./memory_manager');
 const tools = require('./tools');
+const telegramBridge = require('./telegram_bridge');
 const { buildContext, getReducedSnippet } = require('./context_builder');
 
 const skillsDir = path.join(__dirname, '..', 'skills');
@@ -514,6 +515,7 @@ async function runAgent() {
       for (const msgText of parsed.messages) {
         memState.chatHistory.push({ sender: 'agent', time: new Date().toISOString(), text: msgText });
         console.log(`[AGENT -> USER] ${msgText}`);
+        telegramBridge.sendMessage(msgText);
       }
       saveChatHistory();
     }
@@ -672,6 +674,7 @@ async function runAgent() {
       console.log('\n--- Мысль агента ---');
       console.log(parsed.thought);
       console.log('---');
+      telegramBridge.sendThought(parsed.thought);
     }
   } catch (caught) {
     error = caught.message || caught.code || String(caught);
@@ -706,6 +709,11 @@ function main() {
   console.log(`[AGENT] БД: ${path.join(config.memoryDir, 'agent.db')}`);
   console.log(`[AGENT] Записей в STM: ${mem.countShort()}, LTM: ${mem.countLong()}`);
   mem.initBaseAdaptations();
+
+  telegramBridge.startPolling((userInputText) => {
+    pushUserMessage(userInputText);
+  });
+
   runSafely(runAgent);
 }
 

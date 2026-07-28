@@ -32,6 +32,9 @@ const config = {
   decayPenaltyWeight:   floatEnv('DECAY_PENALTY_WEIGHT', 0.5),
   decayHalfLifeDays:    floatEnv('DECAY_HALF_LIFE_DAYS', 1.0),
   
+  telegramBotToken:     process.env.TELEGRAM_BOT_TOKEN || '',
+  telegramChatId:       process.env.TELEGRAM_CHAT_ID || '',
+  
   // 60% Рабочий контекст: краткосрочная память и цели
   maxGoalsInContext:      intEnv('MAX_GOALS_IN_CONTEXT', 5),
   // Schedule clamp bounds — env-driven SSOT for all schedule limits.
