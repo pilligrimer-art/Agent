@@ -117,7 +117,7 @@ class TelegramBridge {
     }
   }
 
-  startPolling(onApprovedUserInput) {
+  async startPolling(onApprovedUserInput) {
     if (!this.isConfigured()) {
       console.log('[TELEGRAM] TELEGRAM_BOT_TOKEN не задан в .env. Трансляция и шлюз отключены.');
       return;
@@ -125,7 +125,18 @@ class TelegramBridge {
 
     this.onUserInputCallback = onApprovedUserInput;
     this.isPolling = true;
-    console.log('[TELEGRAM] Запуск Лонг-поллинга Телеграм бота...');
+
+    // Пропускаем накопленный архив старых апдейтов при перезапуске сервера
+    try {
+      const latest = await this.makeApiRequest('getUpdates', { offset: -1, timeout: 5 });
+      if (latest && latest.ok && Array.isArray(latest.result) && latest.result.length > 0) {
+        const lastId = latest.result[latest.result.length - 1].update_id;
+        this.pollingOffset = lastId + 1;
+        console.log(`[TELEGRAM] Пропущены старые апдейты до update_id: ${lastId}`);
+      }
+    } catch (_) {}
+
+    console.log(`[TELEGRAM] Запуск Лонг-поллинга (offset: ${this.pollingOffset})...`);
     this.pollLoop();
   }
 
