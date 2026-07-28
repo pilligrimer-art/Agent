@@ -512,23 +512,39 @@ async function runAgent() {
 
     // Обработка сообщений от агента
     if (parsed.messages && parsed.messages.length > 0) {
+      let maxPunctuation = 0;
+      let hasQuestion = false;
+
       for (const msgText of parsed.messages) {
         memState.chatHistory.push({ sender: 'agent', time: new Date().toISOString(), text: msgText });
         console.log(`[AGENT -> USER] ${msgText}`);
         telegramBridge.sendMessage(msgText);
 
-        // Таймер ожидания ответа при вопросах пользователю (1 мин минимально, 2 мин если знаков препинания > 2)
         if (msgText.includes('?')) {
+          hasQuestion = true;
           const punctuationCount = (msgText.match(/[\p{P}]/gu) || []).length;
-          const questionTimerSec = punctuationCount > 2 ? 120 : 60;
-          if (!parsed.scheduleSecParsed || parsed.scheduleSec < questionTimerSec) {
-            parsed.scheduleSec = questionTimerSec;
-            parsed.scheduleSecParsed = true;
-            console.log(`[SCHEDULER] ⏱️ Вопрос пользователю. Задан таймер: ${questionTimerSec}с (знаков препинания: ${punctuationCount}).`);
+          if (punctuationCount > maxPunctuation) {
+            maxPunctuation = punctuationCount;
           }
         }
       }
       saveChatHistory();
+
+      // Вычисление задержки планировщика:
+      // - Любое обычное сообщение в чат -> 30 секунд
+      // - Простой вопрос (?) с <= 2 знаками препинания -> 120 секунд (2 минуты)
+      // - Сложный вопрос (?) с > 2 знаками препинания -> 150 секунд (2.5 минуты)
+      let messageTimerSec = 30;
+      if (hasQuestion) {
+        messageTimerSec = maxPunctuation > 2 ? 150 : 120;
+      }
+
+      if (!parsed.scheduleSecParsed || parsed.scheduleSec < messageTimerSec) {
+        parsed.scheduleSec = messageTimerSec;
+        parsed.scheduleSecParsed = true;
+        const typeStr = hasQuestion ? (maxPunctuation > 2 ? 'Сложный вопрос' : 'Простой вопрос') : 'Обычное сообщение';
+        console.log(`[SCHEDULER] ⏱️ ${typeStr} отправлено в чат. Таймер сна: ${messageTimerSec}с (знаков препинания: ${maxPunctuation}).`);
+      }
     }
 
     let reflectionExecuted = false;
