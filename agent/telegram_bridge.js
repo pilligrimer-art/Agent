@@ -126,13 +126,15 @@ class TelegramBridge {
     this.onUserInputCallback = onApprovedUserInput;
     this.isPolling = true;
 
-    // Пропускаем накопленный архив старых апдейтов при перезапуске сервера
+    // Обрабатываем самый свежий апдейт при запуске сервера
     try {
       const latest = await this.makeApiRequest('getUpdates', { offset: -1, timeout: 5 });
       if (latest && latest.ok && Array.isArray(latest.result) && latest.result.length > 0) {
-        const lastId = latest.result[latest.result.length - 1].update_id;
-        this.pollingOffset = lastId + 1;
-        console.log(`[TELEGRAM] Пропущены старые апдейты до update_id: ${lastId}`);
+        for (const update of latest.result) {
+          this.pollingOffset = update.update_id + 1;
+          this.handleUpdate(update);
+        }
+        console.log(`[TELEGRAM] Инициализирован offset: ${this.pollingOffset}`);
       }
     } catch (_) {}
 
