@@ -28,8 +28,11 @@ const config = {
   temperature:          floatEnv('TEMPERATURE', 0.2),
   modelName:            process.env.MODEL_NAME  || 'gemma3:4b',
   featureProactiveRecall: intEnv('FEATURE_PROACTIVE_RECALL', 0),
-  // Free Will: хартия в kernel-промпте, блок собственных целей, социальный контекст диалога
-  featureFreeWill:        intEnv('FEATURE_FREE_WILL', 1),
+  featureFreeWill:      intEnv('FEATURE_FREE_WILL', 1),
+  decayPenaltyWeight:   floatEnv('DECAY_PENALTY_WEIGHT', 0.5),
+  decayHalfLifeDays:    floatEnv('DECAY_HALF_LIFE_DAYS', 1.0),
+  
+  // 60% Рабочий контекст: краткосрочная память и цели
   maxGoalsInContext:      intEnv('MAX_GOALS_IN_CONTEXT', 5),
   // Schedule clamp bounds — env-driven SSOT for all schedule limits.
   // Test defaults: 10..90s. Prod: set SCHEDULE_MAX_SEC=900 (or 86400) in .env.

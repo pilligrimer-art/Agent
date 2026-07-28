@@ -38,13 +38,15 @@ db.exec(`
     created       TEXT DEFAULT (datetime('now')),
     source        TEXT DEFAULT NULL,
     access_count  INTEGER DEFAULT 0,
-    last_accessed TEXT DEFAULT (datetime('now'))
+    last_accessed TEXT DEFAULT (datetime('now')),
+    is_core       INTEGER DEFAULT 0
   );
 `);
 
 // Миграция для старых БД (игнорируем ошибки если колонки уже есть)
 try { db.exec("ALTER TABLE long_mem ADD COLUMN access_count INTEGER DEFAULT 0;"); } catch(e) {}
-try { db.exec("ALTER TABLE long_mem ADD COLUMN last_accessed TEXT DEFAULT (datetime('now'));"); } catch(e) {}
+try { db.exec("ALTER TABLE long_mem ADD COLUMN last_accessed TEXT;"); } catch(e) {}
+try { db.exec("ALTER TABLE long_mem ADD COLUMN is_core INTEGER DEFAULT 0;"); } catch(e) {}
 
 db.exec(`
   CREATE TABLE IF NOT EXISTS adaptations (

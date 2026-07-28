@@ -42,11 +42,18 @@ const stmtGetLong = db.prepare(
   'SELECT * FROM long_mem ORDER BY created DESC LIMIT ?'
 );
 
+const decayLambda = (config.decayHalfLifeDays > 0) ? (0.69314718056 / config.decayHalfLifeDays) : 0;
+
 const stmtSearchLong = db.prepare(`
   SELECT long_mem.* FROM long_mem
     JOIN long_mem_fts ON long_mem.id = long_mem_fts.rowid
     WHERE long_mem_fts MATCH ?
-    ORDER BY rank + (COALESCE(long_mem.access_count, 0) * 0.5) ASC
+    ORDER BY rank + (
+      COALESCE(long_mem.access_count, 0) 
+      * ${config.decayPenaltyWeight} 
+      * EXP(-${decayLambda} * (julianday('now') - julianday(COALESCE(long_mem.last_accessed, datetime('now')))))
+      * (1 - COALESCE(long_mem.is_core, 0))
+    ) ASC
     LIMIT ?
 `);
 
