@@ -59,7 +59,10 @@ const stmtSearchLong = db.prepare(`
 
 const stmtUpdateAccess = db.prepare(`
   UPDATE long_mem 
-  SET access_count = COALESCE(access_count, 0) + 1, last_accessed = datetime('now')
+  SET access_count = COALESCE(access_count, 0) 
+      * EXP(-${decayLambda} * (julianday('now') - julianday(COALESCE(last_accessed, datetime('now'))))) 
+      + 1, 
+      last_accessed = datetime('now')
   WHERE id = ?
 `);
 
