@@ -499,17 +499,14 @@ async function runAgent() {
     const results = await executeActions(parsed, feedback);
     console.log(`[AGENT] Сохранено: ${results.saved}, удалено: ${results.deleted}`);
 
-    // Детекция символа выбора модели '+' или '-' при сообщении пользователя
-    const choiceTarget = (parsed.messages && parsed.messages.length > 0) ? parsed.messages[0] : parsed.thought;
-    if (choiceTarget) {
-      const trimmed = choiceTarget.trim();
-      let symbol = null;
-      if (trimmed.startsWith('+')) symbol = '+';
-      else if (trimmed.startsWith('-')) symbol = '-';
+    // Детекция символов '+++' или '---' в любом месте размышления или ответа модели
+    const fullOutputText = response || '';
+    let symbol = null;
+    if (fullOutputText.includes('+++')) symbol = '+';
+    else if (fullOutputText.includes('---')) symbol = '-';
 
-      if (symbol && memState.lastUserId) {
-        telegramBridge.recordModelChoice(symbol, memState.lastUserId);
-      }
+    if (symbol && memState.lastUserId) {
+      telegramBridge.recordModelChoice(symbol, memState.lastUserId);
     }
     
     memState.totalRuns++;

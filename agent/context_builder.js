@@ -205,7 +205,7 @@ function buildContext(thoughtHistory = [], userMessages = [], consecutiveParseEr
     if (regularMsgs.length > 0) {
       messagesBlock = `\n\n=== MESSAGES FROM USER (NEW) ===\n` +
         regularMsgs.map(m => `[${m.time}] USER: ${m.text}`).join('\n') +
-        `\n\n[🚨 STRICT RED PROMPT DIRECTIVE]\nA user message has arrived! You MUST start your response or reasoning with '+' or '-':\n- Start your message with '+' if you WANT to answer this user message.\n- Start your message with '-' if you DO NOT WANT to answer this user message.\nExample: [SEND_MESSAGE "+ Hello! I would like to answer..."] or [SEND_MESSAGE "- I prefer not to answer."]\n`;
+        `\n\n[🚨 STRICT RED PROMPT DIRECTIVE]\nA user message has arrived! You MUST indicate your willingness by including '+++' or '---' anywhere in your reasoning or message:\n- Include '+++' anywhere if you WANT to answer this user message.\n- Include '---' anywhere if you DO NOT WANT to answer this user message.\nExample: REASONING: I am happy to answer this +++ ...\n`;
     }
 
     if (redirectMsgs.length > 0) {
