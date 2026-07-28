@@ -3,6 +3,7 @@ const config = require('./config');
 let timer = null;
 let isRunning = false;
 let nextRunTime = null;
+let hasPendingImmediateRun = false;
 
 /**
  * Зажать значение интервала сна по конфигурационным лимитам.
@@ -55,7 +56,8 @@ function scheduleNext(runAgent, seconds) {
  */
 async function runSafely(runAgent) {
   if (isRunning) {
-    console.warn('[SCHEDULER] Предыдущий цикл ещё активен — пропуск.');
+    hasPendingImmediateRun = true;
+    console.warn('[SCHEDULER] Предыдущий цикл ещё активен — запуск запланирован сразу по завершению.');
     return;
   }
   isRunning = true;
@@ -63,10 +65,15 @@ async function runSafely(runAgent) {
     await runAgent();
   } catch (err) {
     console.error(`[SCHEDULER] Ошибка цикла: ${err.message}`);
-    // При ошибке — перезапланировать по умолчанию
     scheduleNext(runAgent, config.defaultIntervalSec);
   } finally {
     isRunning = false;
+    if (hasPendingImmediateRun) {
+      hasPendingImmediateRun = false;
+      console.log('[SCHEDULER] ⚡ Немедленный запуск отложенного сообщения пользователя...');
+      clearScheduledRun();
+      runSafely(runAgent);
+    }
   }
 }
 
