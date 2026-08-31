@@ -65,6 +65,32 @@ db.exec(`
   );
 `);
 
+// --- Mem0-Style User Profiles & Dossiers ---
+db.exec(`
+  CREATE TABLE IF NOT EXISTS user_profiles (
+    username          TEXT PRIMARY KEY,
+    user_id           INTEGER,
+    preferences       TEXT DEFAULT '',
+    notes             TEXT DEFAULT '',
+    interaction_count INTEGER DEFAULT 1,
+    last_seen         TEXT DEFAULT (datetime('now')),
+    created_at        TEXT DEFAULT (datetime('now')),
+    updated_at        TEXT DEFAULT (datetime('now'))
+  );
+`);
+
+// --- HippoRAG Light: Associative Concept Graph ---
+db.exec(`
+  CREATE TABLE IF NOT EXISTS concept_links (
+    concept_a   TEXT NOT NULL,
+    concept_b   TEXT NOT NULL,
+    weight      REAL DEFAULT 1.0,
+    updated_at  TEXT DEFAULT (datetime('now')),
+    PRIMARY KEY (concept_a, concept_b)
+  );
+`);
+
+
 // --- FTS5 виртуальная таблица для полнотекстового поиска ---
 
 db.exec(`

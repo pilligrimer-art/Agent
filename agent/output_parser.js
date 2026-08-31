@@ -38,37 +38,157 @@ function normalizeModelOutput(text) {
     .replace(/[\u200B-\u200D\uFEFF]/g, '');
 }
 
-function safeParseJson(raw) {
+function lenientJsonParse(raw) {
+  if (!raw || typeof raw !== 'string') return { ok: false, error: 'Empty payload' };
+  
+  // 1. First attempt: standard JSON parse
   try {
     return { ok: true, value: JSON.parse(raw) };
-  } catch (e) {
-    const start = raw.indexOf('{');
-    if (start >= 0) {
-      let openBraces = 0;
-      let inString = false;
-      let escape = false;
-      for (let i = start; i < raw.length; i++) {
-        const char = raw[i];
-        if (!escape && char === '"') inString = !inString;
-        if (!inString) {
-          if (char === '{') openBraces++;
-          if (char === '}') openBraces--;
-        }
-        if (char === '\\' && !escape) escape = true;
-        else escape = false;
-        if (openBraces === 0) {
-          const extracted = raw.substring(start, i + 1);
-          try {
-            return { ok: true, value: JSON.parse(extracted) };
-          } catch(e2) {
-            break;
-          }
-        }
+  } catch (_) {}
+
+  // 2. Second attempt: bracket-balanced substring extraction
+  const start = raw.indexOf('{');
+  if (start >= 0) {
+    let openBraces = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = start; i < raw.length; i++) {
+      const char = raw[i];
+      if (!escape && char === '"') inString = !inString;
+      if (!inString) {
+        if (char === '{') openBraces++;
+        if (char === '}') openBraces--;
+      }
+      if (char === '\\' && !escape) escape = true;
+      else escape = false;
+
+      if (openBraces === 0) {
+        const extracted = raw.substring(start, i + 1);
+        try {
+          return { ok: true, value: JSON.parse(extracted) };
+        } catch (_) {}
       }
     }
-    return { ok: false, error: e.message };
   }
+
+  // 3. Third attempt: Sanitize common JSON errors (trailing commas, unclosed brackets)
+  let candidate = start >= 0 ? raw.substring(start) : raw;
+  candidate = candidate.trim()
+    .replace(/,\s*([\}\]])/g, '$1') // Trailing comma fix
+    .replace(/[\u201C\u201D\u00AB\u00BB]/g, '"') // Typographic quotes
+    .replace(/[\u2018\u2019]/g, "'");
+
+  // Auto-close open braces if truncated
+  let openCount = (candidate.match(/\{/g) || []).length;
+  let closeCount = (candidate.match(/\}/g) || []).length;
+  if (openCount > closeCount) {
+    candidate += '}'.repeat(openCount - closeCount);
+  }
+
+  try {
+    return { ok: true, value: JSON.parse(candidate) };
+  } catch (_) {}
+
+  // 4. Fourth attempt: Heuristic field extraction (fixes unescaped quotes in content/text/rule)
+  const result = {};
+  let fieldsFound = 0;
+
+  // Extract content
+  const contentMatch = candidate.match(/"content"\s*:\s*"([\s\S]*?)"(?=\s*,\s*"\w+"\s*:|\s*\})/i);
+  if (contentMatch) {
+    result.content = contentMatch[1].trim();
+    fieldsFound++;
+  }
+
+  // Extract text (for SEND_MESSAGE)
+  const textMatch = candidate.match(/"text"\s*:\s*"([\s\S]*?)"(?=\s*,\s*"\w+"\s*:|\s*\})/i);
+  if (textMatch) {
+    result.text = textMatch[1].trim();
+    fieldsFound++;
+  }
+
+  // Extract type
+  const typeMatch = candidate.match(/"type"\s*:\s*"([^"]+)"/i);
+  if (typeMatch) {
+    result.type = typeMatch[1].trim();
+    fieldsFound++;
+  }
+
+  // Extract priority
+  const priorityMatch = candidate.match(/"priority"\s*:\s*"([^"]+)"/i);
+  if (priorityMatch) {
+    result.priority = priorityMatch[1].trim();
+    fieldsFound++;
+  }
+
+  // Extract why
+  const whyMatch = candidate.match(/"why"\s*:\s*"([\s\S]*?)"(?=\s*,\s*"\w+"\s*:|\s*\})/i);
+  if (whyMatch) {
+    result.why = whyMatch[1].trim();
+    fieldsFound++;
+  }
+
+  // Extract rule & target (for adaptations)
+  const ruleMatch = candidate.match(/"rule"\s*:\s*"([\s\S]*?)"(?=\s*,\s*"\w+"\s*:|\s*\})/i);
+  if (ruleMatch) {
+    result.rule = ruleMatch[1].trim();
+    fieldsFound++;
+  }
+  const targetMatch = candidate.match(/"target"\s*:\s*"([^"]+)"/i);
+  if (targetMatch) {
+    result.target = targetMatch[1].trim();
+    fieldsFound++;
+  }
+
+  // Extract topic & limit (for focus)
+  const topicMatch = candidate.match(/"topic"\s*:\s*"([^"]+)"/i);
+  if (topicMatch) {
+    result.topic = topicMatch[1].trim();
+    fieldsFound++;
+  }
+  const limitMatch = candidate.match(/"limit"\s*:\s*(\d+)/i);
+  if (limitMatch) {
+    result.limit = parseInt(limitMatch[1], 10);
+    fieldsFound++;
+  }
+
+  // Extract id & amount (for adapt challenge/weaken)
+  const idMatch = candidate.match(/"id"\s*:\s*"([^"]+)"/i);
+  if (idMatch) {
+    result.id = idMatch[1].trim();
+    fieldsFound++;
+  }
+  const amountMatch = candidate.match(/"amount"\s*:\s*([\d\.]+)/i);
+  if (amountMatch) {
+    result.amount = parseFloat(amountMatch[1]);
+    fieldsFound++;
+  }
+  const replacementMatch = candidate.match(/"replacement"\s*:\s*"([\s\S]*?)"(?=\s*,\s*"\w+"\s*:|\s*\})/i);
+  if (replacementMatch) {
+    result.replacement = replacementMatch[1].trim();
+    fieldsFound++;
+  }
+
+  // Extract tags
+  const tagsMatch = candidate.match(/"tags"\s*:\s*(\[[^\]]*\]|"[^"]*")/i);
+  if (tagsMatch) {
+    try {
+      result.tags = JSON.parse(tagsMatch[1]);
+    } catch (_) {
+      result.tags = tagsMatch[1].replace(/[\[\]"]/g, '').split(',').map(s => s.trim());
+    }
+    fieldsFound++;
+  }
+
+  if (fieldsFound > 0 && (result.content || result.text || result.topic || result.rule || result.id || result.target)) {
+    return { ok: true, value: result, repaired: true };
+  }
+
+  return { ok: false, error: 'Malformed JSON payload' };
 }
+
+// Backward compatibility alias
+const safeParseJson = lenientJsonParse;
 
 function extractFollowingContent(afterText) {
   afterText = afterText.trim();
@@ -116,6 +236,20 @@ function cleanProseText(t) {
   return cleaned;
 }
 
+function extractPaths(argsString) {
+  const paths = [];
+  const regex = /"([^"]+)"|'([^']+)'|(\S+)/g;
+  let match;
+  while ((match = regex.exec(argsString)) !== null) {
+    const p = match[1] || match[2] || match[3];
+    if (p) {
+      // Remove trailing brackets or commas that might have stuck to unquoted paths
+      paths.push(p.replace(/^[\[\]\,]+|[\[\]\,]+$/g, '').trim());
+    }
+  }
+  return paths.filter(p => p.length > 0);
+}
+
 const SUGGESTED = {
   MEM_SAVE: '[MEM_SAVE short] {"type":"thought","content":"...","priority":"normal","why":"..."}',
   MEM_SAVE_LONG: '[MEM_SAVE long] {"type":"insight","content":"...","tags":["topic"],"why":"..."}',
@@ -128,7 +262,291 @@ const SUGGESTED = {
   SCHEDULE: '[SCHEDULE 60]',
   REFLECT: '[REFLECT]',
   SEND_MESSAGE: '[SEND_MESSAGE] {"text":"...","why":"..."}',
+  THINK_LEVEL: '[THINK_LEVEL "high"]',
+  USER_PROFILE: '[USER_PROFILE "@username"] {"preferences":"...","notes":"..."}',
 };
+
+// ── Карта мультиязычных и семантических алиасов ──────────────────────────────
+const TAG_ALIASES = {
+  // User Profiles (Mem0 Layer)
+  'USER_PROFILE': 'USER_PROFILE',
+  'USER_NOTE': 'USER_PROFILE',
+  'USER_UPDATE': 'USER_PROFILE',
+  'PROFILE_USER': 'USER_PROFILE',
+  'SET_USER': 'USER_PROFILE',
+  'ПРОФИЛЬ': 'USER_PROFILE',
+
+  // Messages / Communication
+  'SEND_MESSAGE': 'SEND_MESSAGE',
+  'MESSAGE': 'SEND_MESSAGE',
+  'MSG': 'SEND_MESSAGE',
+  'REPLY': 'SEND_MESSAGE',
+  'NOTIFY': 'SEND_MESSAGE',
+
+  'SAY': 'SEND_MESSAGE',
+  'CHAT': 'SEND_MESSAGE',
+  'TELL': 'SEND_MESSAGE',
+  'SPEAK': 'SEND_MESSAGE',
+  'TALK': 'SEND_MESSAGE',
+  'OUT': 'SEND_MESSAGE',
+  'OUTPUT': 'SEND_MESSAGE',
+  'SEND': 'SEND_MESSAGE',
+  'POST': 'SEND_MESSAGE',
+  'WRITE': 'SEND_MESSAGE',
+  'RESPOND': 'SEND_MESSAGE',
+  'ANSWER': 'SEND_MESSAGE',
+  'DISPATCH': 'SEND_MESSAGE',
+  'EMIT': 'SEND_MESSAGE',
+  'BROADCAST': 'SEND_MESSAGE',
+  'TRANSMIT': 'SEND_MESSAGE',
+  'USER_MSG': 'SEND_MESSAGE',
+  'SEND_MSG': 'SEND_MESSAGE',
+  'REPLY_USER': 'SEND_MESSAGE',
+  'TG_SEND': 'SEND_MESSAGE',
+  'TELEGRAM_SEND': 'SEND_MESSAGE',
+  'ОТВЕТИТЬ': 'SEND_MESSAGE',
+  'СООБЩЕНИЕ': 'SEND_MESSAGE',
+  'СКАЗАТЬ': 'SEND_MESSAGE',
+  'НАПИСАТЬ': 'SEND_MESSAGE',
+  'ОТПРАВИТЬ': 'SEND_MESSAGE',
+
+  // Memory Save
+  'MEM_SAVE': 'MEM_SAVE',
+  'SAVE': 'MEM_SAVE',
+  'REMEMBER': 'MEM_SAVE',
+  'NOTE': 'MEM_SAVE',
+  'RECORD': 'MEM_SAVE',
+  'STORE': 'MEM_SAVE',
+  'KEEP': 'MEM_SAVE',
+  'MEMORIZE': 'MEM_SAVE',
+  'LOG': 'MEM_SAVE',
+  'WRITE_MEM': 'MEM_SAVE',
+  'PUT_MEM': 'MEM_SAVE',
+  'INSERT_MEM': 'MEM_SAVE',
+  'INSIGHT': 'MEM_SAVE',
+  'KNOWLEDGE': 'MEM_SAVE',
+  'FACT': 'MEM_SAVE',
+  'TASK': 'MEM_SAVE',
+  'SAVE_MEM': 'MEM_SAVE',
+  'MEM_STORE': 'MEM_SAVE',
+  'MEM_ADD': 'MEM_SAVE',
+  'ADD_MEM': 'MEM_SAVE',
+  'SET_MEM': 'MEM_SAVE',
+  'SHORT_MEM': 'MEM_SAVE',
+  'LONG_MEM': 'MEM_SAVE',
+  'ARCHIVE': 'MEM_SAVE',
+  'СОХРАНИТЬ': 'MEM_SAVE',
+  'ЗАПОМНИТЬ': 'MEM_SAVE',
+  'ЗАМЕТКА': 'MEM_SAVE',
+  'ПАМЯТЬ': 'MEM_SAVE',
+  'ЗАПИСАТЬ': 'MEM_SAVE',
+  'ИНСАЙТ': 'MEM_SAVE',
+
+  // Memory Focus & Search
+  'MEM_FOCUS': 'MEM_FOCUS',
+  'FOCUS': 'MEM_FOCUS',
+  'SEARCH': 'MEM_FOCUS',
+  'FIND': 'MEM_FOCUS',
+  'RECALL': 'MEM_FOCUS',
+  'LOOKUP': 'MEM_FOCUS',
+  'QUERY': 'MEM_FOCUS',
+  'RETRIEVE': 'MEM_FOCUS',
+  'FETCH': 'MEM_FOCUS',
+  'LOCATE': 'MEM_FOCUS',
+  'SCAN_MEM': 'MEM_FOCUS',
+  'INSPECT': 'MEM_FOCUS',
+  'EXPLORE': 'MEM_FOCUS',
+  'DISCOVER': 'MEM_FOCUS',
+  'MEM_SEARCH': 'MEM_FOCUS',
+  'SEARCH_MEM': 'MEM_FOCUS',
+  'FOCUS_MEM': 'MEM_FOCUS',
+  'GET_MEM': 'MEM_FOCUS',
+  'FIND_MEM': 'MEM_FOCUS',
+  'НАЙТИ': 'MEM_FOCUS',
+  'ПОИСК': 'MEM_FOCUS',
+  'ВСПОМНИТЬ': 'MEM_FOCUS',
+  'ФОКУС': 'MEM_FOCUS',
+
+  // Memory Delete
+  'MEM_DELETE': 'MEM_DELETE',
+  'DELETE': 'MEM_DELETE',
+  'REMOVE': 'MEM_DELETE',
+  'FORGET': 'MEM_DELETE',
+  'ERASE': 'MEM_DELETE',
+  'DROP': 'MEM_DELETE',
+  'CLEAR_MEM': 'MEM_DELETE',
+  'PURGE': 'MEM_DELETE',
+  'DISCARD': 'MEM_DELETE',
+  'UNSET': 'MEM_DELETE',
+  'DEL_MEM': 'MEM_DELETE',
+  'MEM_DEL': 'MEM_DELETE',
+  'DELETE_MEM': 'MEM_DELETE',
+  'REMOVE_MEM': 'MEM_DELETE',
+  'УДАЛИТЬ': 'MEM_DELETE',
+  'СТЕРЕТЬ': 'MEM_DELETE',
+  'ЗАБЫТЬ': 'MEM_DELETE',
+
+  // Scheduling & Sleep
+  'SCHEDULE': 'SCHEDULE',
+  'SLEEP': 'SCHEDULE',
+  'WAIT': 'SCHEDULE',
+  'DELAY': 'SCHEDULE',
+  'PAUSE': 'SCHEDULE',
+  'REST': 'SCHEDULE',
+  'IDLE': 'SCHEDULE',
+  'SNOOZE': 'SCHEDULE',
+  'DEFER': 'SCHEDULE',
+  'HOLD': 'SCHEDULE',
+  'TIMER': 'SCHEDULE',
+  'WAKE_IN': 'SCHEDULE',
+  'NEXT_RUN': 'SCHEDULE',
+  'SET_TIMER': 'SCHEDULE',
+  'SLEEP_FOR': 'SCHEDULE',
+  'WAIT_SEC': 'SCHEDULE',
+  'ПАУЗА': 'SCHEDULE',
+  'СОН': 'SCHEDULE',
+  'ЖДАТЬ': 'SCHEDULE',
+  'ТАЙМЕР': 'SCHEDULE',
+  'ОТЛОЖИТЬ': 'SCHEDULE',
+
+  // Thinking Effort / CoT depth
+  'THINK_LEVEL': 'THINK_LEVEL',
+  'THINK_BUDGET': 'THINK_LEVEL',
+  'REASONING_EFFORT': 'THINK_LEVEL',
+  'THINK': 'THINK_LEVEL',
+  'EFFORT': 'THINK_LEVEL',
+  'REASONING': 'THINK_LEVEL',
+  'BUDGET': 'THINK_LEVEL',
+  'COT_LEVEL': 'THINK_LEVEL',
+  'THINK_DEPTH': 'THINK_LEVEL',
+  'DEPTH': 'THINK_LEVEL',
+  'REASON_EFFORT': 'THINK_LEVEL',
+  'COMPUTE': 'THINK_LEVEL',
+  'MODE': 'THINK_LEVEL',
+  'THINKING': 'THINK_LEVEL',
+  'REASONING_LEVEL': 'THINK_LEVEL',
+  'COT': 'THINK_LEVEL',
+  'РЕЖИМ_МЫСЛЕЙ': 'THINK_LEVEL',
+  'ДУМАТЬ': 'THINK_LEVEL',
+  'ГЛУБИНА': 'THINK_LEVEL',
+
+  // Reflection
+  'REFLECT': 'REFLECT',
+  'COMPRESS': 'REFLECT',
+  'SYNTHESIZE': 'REFLECT',
+  'CONSOLIDATE': 'REFLECT',
+  'REVIEW': 'REFLECT',
+  'CONTEMPLATE': 'REFLECT',
+  'SELF_EVALUATE': 'REFLECT',
+  'PONDER': 'REFLECT',
+  'MEDITATE': 'REFLECT',
+  'INTROSPECT': 'REFLECT',
+  'РЕФЛЕКСИЯ': 'REFLECT',
+  'АНАЛИЗ': 'REFLECT',
+  'ОСМЫСЛИТЬ': 'REFLECT',
+
+  // Adaptations
+  'MEM_ADAPT': 'MEM_ADAPT',
+  'ADAPT': 'MEM_ADAPT',
+  'RULE': 'MEM_ADAPT',
+  'BEHAVIOR': 'MEM_ADAPT',
+  'HEURISTIC': 'MEM_ADAPT',
+  'POLICY': 'MEM_ADAPT',
+  'NEW_RULE': 'MEM_ADAPT',
+  'SET_RULE': 'MEM_ADAPT',
+  'ADAPTATION': 'MEM_ADAPT',
+  'АДАПТАЦИЯ': 'MEM_ADAPT',
+  'MEM_ADAPT_CHALLENGE': 'MEM_ADAPT_CHALLENGE',
+  'CHALLENGE': 'MEM_ADAPT_CHALLENGE',
+  'REVISE_RULE': 'MEM_ADAPT_CHALLENGE',
+  'UPDATE_RULE': 'MEM_ADAPT_CHALLENGE',
+  'RETHINK_RULE': 'MEM_ADAPT_CHALLENGE',
+  'MODIFY_RULE': 'MEM_ADAPT_CHALLENGE',
+  'ПЕРЕСМОТР': 'MEM_ADAPT_CHALLENGE',
+  'MEM_ADAPT_WEAKEN': 'MEM_ADAPT_WEAKEN',
+  'WEAKEN': 'MEM_ADAPT_WEAKEN',
+  'UNLEARN': 'MEM_ADAPT_WEAKEN',
+  'DECAY_RULE': 'MEM_ADAPT_WEAKEN',
+  'REDUCE_RULE': 'MEM_ADAPT_WEAKEN',
+  'FADE_RULE': 'MEM_ADAPT_WEAKEN',
+  'ОСЛАБИТЬ': 'MEM_ADAPT_WEAKEN',
+
+  // Curiosity & Self-Questions
+  'SELF_QUESTION': 'SELF_QUESTION',
+  'QUESTION': 'SELF_QUESTION',
+  'ASK_SELF': 'SELF_QUESTION',
+  'WONDER': 'SELF_QUESTION',
+  'INQUIRE': 'SELF_QUESTION',
+  'CURIOSITY': 'SELF_QUESTION',
+  'TOPIC_SCORE': 'TOPIC_SCORE',
+  'SCORE_TOPIC': 'TOPIC_SCORE',
+  'INTEREST': 'TOPIC_SCORE',
+  'RATE_TOPIC': 'TOPIC_SCORE',
+  'TOPIC_RATING': 'TOPIC_SCORE',
+
+  // Help
+  'HELP_ACTION': 'HELP_ACTION',
+  'HELP_ACTIONS': 'HELP_ACTIONS',
+  'HELP': 'HELP_ACTIONS',
+  'SYNTAX': 'HELP_ACTIONS',
+  'TOOL_INFO': 'HELP_ACTIONS',
+  'MAN': 'HELP_ACTIONS',
+  'DOCS': 'HELP_ACTIONS',
+  'ALL_TOOLS': 'HELP_ACTIONS',
+  'TOOLS': 'HELP_ACTIONS',
+  'ПОМОЩЬ': 'HELP_ACTIONS',
+
+  // MCP
+  'MCP_LIST': 'MCP_LIST',
+  'LS': 'MCP_LIST',
+  'DIR': 'MCP_LIST',
+  'LIST_FILES': 'MCP_LIST',
+  'LIST_DIR': 'MCP_LIST',
+  'MCP_READ': 'MCP_READ',
+  'CAT': 'MCP_READ',
+  'READ': 'MCP_READ',
+  'VIEW_FILE': 'MCP_READ',
+  'GET_FILE': 'MCP_READ',
+  'READ_FILE': 'MCP_READ'
+};
+
+
+// ── Генератор хирургических точечных подсказок (Surgical Diff Hints) ──────────
+function makeSurgicalHint(intent, observed, reason) {
+  const cleanObserved = (observed || '').trim().replace(/\s+/g, ' ');
+  let exactFix = SUGGESTED[intent] || `[${intent}]`;
+
+  if (intent === 'MEM_SAVE') {
+    const textSnippet = cleanProseText(cleanObserved.replace(/\[?(MEM_SAVE|SAVE|СОХРАНИТЬ|ЗАПОМНИТЬ|NOTE)\s*(short|long)?\]?:?/iu, ''));
+    if (textSnippet && textSnippet.length > 2) {
+      exactFix = `[MEM_SAVE short] {"type":"thought","content":"${textSnippet.slice(0, 50).replace(/"/g, "'")}"}`;
+    }
+  } else if (intent === 'SEND_MESSAGE') {
+    const textSnippet = cleanProseText(cleanObserved.replace(/\[?(SEND_MESSAGE|MESSAGE|СООБЩЕНИЕ|ОТВЕТИТЬ|REPLY)\b\]?:?/iu, ''));
+    if (textSnippet && textSnippet.length > 2) {
+      exactFix = `[SEND_MESSAGE] {"text":"${textSnippet.slice(0, 50).replace(/"/g, "'")}"}`;
+    }
+  } else if (intent === 'SCHEDULE') {
+    const num = (cleanObserved.match(/\d+/) || [])[0] || '60';
+    exactFix = `[SCHEDULE ${num}]`;
+  } else if (intent === 'THINK_LEVEL') {
+    const lvl = (cleanObserved.match(/high|medium|light|low|глубоко|быстро|средне/i) || [])[0] || 'high';
+    const normLvl = (lvl === 'low' || lvl === 'быстро') ? 'light' : (lvl === 'глубоко' ? 'high' : 'medium');
+    exactFix = `[THINK_LEVEL "${normLvl}"]`;
+  } else if (intent === 'MEM_FOCUS') {
+    const id = (cleanObserved.match(/#([SL]?\d+)/i) || [])[0] || '#S1';
+    exactFix = `[MEM_FOCUS ${id}]`;
+  }
+
+  return {
+    intent,
+    observed: cleanObserved.slice(0, 80),
+    reason: reason || 'Invalid format',
+    exactFix
+  };
+}
+
+
 
 // ========== HALLUCINATION PATTERNS TABLE ==========
 // Each entry: { re, group, intent, autofix, extract }
@@ -182,6 +600,11 @@ const HALLUCINATION_PATTERNS = [
       if (tagName === 'SEND_MESSAGE') {
         const txt = cleanProseText(rest);
         if (txt.length > 2) return { kind: 'SEND_MESSAGE', text: txt };
+        return null;
+      }
+      if (tagName === 'MCP_LIST' || tagName === 'MCP_READ') {
+        const paths = extractPaths(rest);
+        if (paths.length > 0) return { kind: tagName, paths };
         return null;
       }
       return null;
@@ -245,7 +668,7 @@ const HALLUCINATION_PATTERNS = [
 
   // ── GROUP B: colon-separator  [MEM_SAVE]: {...} ─────────────────────────
   {
-    re: /\[(MEM_SAVE|MEM_FOCUS|SCHEDULE|SEND_MESSAGE|REFLECT|MEM_ADAPT|MEM_DELETE)\s*(short|long)?\]\s*:\s*([^\n\[]{1,400})/gi,
+    re: /\[(MEM_SAVE|MEM_FOCUS|SCHEDULE|SEND_MESSAGE|REFLECT|MEM_ADAPT|MEM_DELETE|MCP_LIST|MCP_READ)\s*(short|long)?\]\s*:\s*([^\n\[]{1,400})/gi,
     group: 'B_colon_sep',
     autofix: true,
     extract(match) {
@@ -277,6 +700,11 @@ const HALLUCINATION_PATTERNS = [
       if (tagName === 'SEND_MESSAGE') {
         const txt = cleanProseText(rest);
         if (txt.length > 2) return { kind: 'SEND_MESSAGE', text: txt };
+        return null;
+      }
+      if (tagName === 'MCP_LIST' || tagName === 'MCP_READ') {
+        const paths = extractPaths(rest);
+        if (paths.length > 0) return { kind: tagName, paths };
         return null;
       }
       return null;
@@ -469,8 +897,15 @@ function _applyExtraction(resolved, actions, addToolHint, logTelemetry, SUGGESTE
     logTelemetry('parser.hallucination_repaired', { group: patternGroup, kind:'SEND_MESSAGE', raw: rawMatch.slice(0,60) });
     return true;
   }
+  if (kind === 'THINK_LEVEL') {
+    actions.thinkLevel = resolved.level;
+    actions.feedback.executed.push({ intent:'THINK_LEVEL', summary:`[parser: understood as THINK_LEVEL ${resolved.level.toUpperCase()}]` });
+    logTelemetry('parser.hallucination_repaired', { group: patternGroup, kind:'THINK_LEVEL', raw: rawMatch.slice(0,60) });
+    return true;
+  }
   return false;
 }
+
 
 // ── Main hallucination-scan function (runs on `normalized`, AFTER main pass) ─
 function processHallucinationPatterns(normalized, actions, addToolHint, logTelemetry, SUGGESTED) {
@@ -535,38 +970,53 @@ function parseOutput(text) {
   const normalized = normalizedFull;
 
   const actions = {
-    thought: '',
     saves: [],
     deletes: [],
     adapts: [],
     adaptChallenges: [],
     adaptWeakens: [],
-    messages: [],
-    mcpLists: [],
-    mcpReads: [],
-    helpRequests: [],
     focusIds: [],
     focusTopics: [],
     scheduleSec: config.defaultIntervalSec,
-    reflect: false,
-    parseErrorCount: 0,
-    repairedCount: 0,
     scheduleSecParsed: false,
+    reflect: false,
+    messages: [],
+    userProfiles: [],
+    helpRequests: [],
+    mcpLists: [],
+    mcpReads: [],
     dynamicSkills: [],
+    thought: '',
+    selfQuestion: null,
+    topicScore: null,
+    resolveTopic: null,
+    thinkLevel: null,
+    repairedCount: 0,
+    parseErrorCount: 0,
+
     feedback: {
       executed: [],
       failed: [],
+      blocked: [],
       hints: []
     }
   };
+
 
   const addHelp = (tag) => {
     if (!actions.helpRequests.includes(tag)) actions.helpRequests.push(tag);
   };
 
   const addFailed = (intent, observed, reason, suggested) => {
-    actions.feedback.failed.push({ intent, observed: observed.trim(), reason, suggested });
-    logTelemetry('parser.malformed_intent', { intent, observed: observed.trim().slice(0, 60), reason });
+    const hint = makeSurgicalHint(intent, observed, reason);
+    actions.feedback.failed.push({
+      intent,
+      observed: hint.observed,
+      reason: hint.reason,
+      exactFix: hint.exactFix,
+      suggested: suggested || hint.exactFix
+    });
+    logTelemetry('parser.malformed_intent', { intent, observed: hint.observed, reason });
   };
 
   const addToolHint = (intent, observed, suggested, explanation) => {
@@ -575,9 +1025,12 @@ function parseOutput(text) {
   };
 
   const commandRanges = [];
-  const coreTags = ['MEM_SAVE','MEM_DELETE','MEM_FOCUS','MEM_ADAPT_CHALLENGE','MEM_ADAPT_WEAKEN','MEM_ADAPT','SCHEDULE','REFLECT','SEND_MESSAGE','HELP_ACTION','HELP_ACTIONS','MCP_LIST','MCP_READ'];
-  const allTags = Array.from(new Set([...coreTags, ...dynamicTags]));
-  const RE_ANY_TAG = new RegExp(`\\[(${allTags.join('|')})\\b([^\\]]*)\\]`, 'gi');
+  const coreTags = ['MEM_SAVE','MEM_DELETE','MEM_FOCUS','MEM_ADAPT_CHALLENGE','MEM_ADAPT_WEAKEN','MEM_ADAPT','SCHEDULE','REFLECT','SEND_MESSAGE','HELP_ACTION','HELP_ACTIONS','MCP_LIST','MCP_READ','THINK_LEVEL','THINK_BUDGET','REASONING_EFFORT','USER_PROFILE'];
+  const allAliases = Object.keys(TAG_ALIASES);
+  const allTags = Array.from(new Set([...coreTags, ...allAliases, ...dynamicTags]));
+  const RE_ANY_TAG = new RegExp(`\\[(${allTags.join('|')})(?=[\\s\\]:]|$)([^\\]]*)\\]`, 'giu');
+
+
 
   let match;
   while ((match = RE_ANY_TAG.exec(normalized)) !== null) {
@@ -585,7 +1038,11 @@ function parseOutput(text) {
     const tagLen = match[0].length;
     const closingBracketIndex = startIdx + tagLen;
 
-    const intent = match[1].toUpperCase();
+    const rawIntent = match[1].toUpperCase();
+    const intent = TAG_ALIASES[rawIntent] || rawIntent;
+    if (rawIntent !== intent) {
+      logTelemetry('parser.alias_resolved', { from: rawIntent, to: intent });
+    }
     const bracketParams = match[2] ? match[2].trim() : '';
 
     const afterTextRaw = normalized.substring(closingBracketIndex);
@@ -600,7 +1057,9 @@ function parseOutput(text) {
     const observed = `${match[0]} ${proseFollowing.slice(0, 50)}`;
 
     if (intent === 'MEM_SAVE') {
-      const kind = (bracketParams.includes('long') || proseFollowing.includes('long')) ? 'long' : 'short';
+      const isLong = /\b(long|инсайт|архив|опыт|insight|archive)\b/i.test(bracketParams + ' ' + proseFollowing);
+      const kind = isLong ? 'long' : 'short';
+
       
       let parsed = { ok: false };
       const startBrace = combinedArgs.indexOf('{');
@@ -698,7 +1157,7 @@ function parseOutput(text) {
           acted = true;
           logTelemetry('parser.valid_action', { intent: 'MEM_FOCUS', ids: formattedIds });
         } else {
-          const cleanedTopic = cleanProseText(combinedArgs);
+          const cleanedTopic = cleanProseText(combinedArgs.replace(/^[#\s]+/, ''));
           if (cleanedTopic.length > 0) {
             actions.focusTopics.push({ topic: cleanedTopic, limit: 3 });
             acted = true;
@@ -706,6 +1165,7 @@ function parseOutput(text) {
             addToolHint('MEM_FOCUS', observed, SUGGESTED.MEM_FOCUS,
               `Focused on topic "${cleanedTopic}". If you meant to focus on specific memory record IDs, use: [MEM_FOCUS #ID]`);
           }
+
         }
       }
 
@@ -790,18 +1250,20 @@ function parseOutput(text) {
     }
     
     else if (intent === 'MCP_LIST') {
-      const matchPath = combinedArgs.match(/"([^"]+)"|'([^']+)'|(\S+)/);
-      const targetPath = matchPath ? (matchPath[1] || matchPath[2] || matchPath[3] || '').trim() : '';
-      actions.mcpLists.push(targetPath);
-      logTelemetry('parser.valid_action', { intent: 'MCP_LIST', path: targetPath });
+      const paths = extractPaths(combinedArgs);
+      if (paths.length > 0) {
+        actions.mcpLists.push(...paths);
+        paths.forEach(p => logTelemetry('parser.valid_action', { intent: 'MCP_LIST', path: p }));
+      } else {
+        addFailed('MCP_LIST', observed, 'missing_path', '[MCP_LIST "directory_path"]');
+      }
     }
 
     else if (intent === 'MCP_READ') {
-      const matchPath = combinedArgs.match(/"([^"]+)"|'([^']+)'|(\S+)/);
-      const targetPath = matchPath ? (matchPath[1] || matchPath[2] || matchPath[3] || '').trim() : '';
-      if (targetPath) {
-        actions.mcpReads.push(targetPath);
-        logTelemetry('parser.valid_action', { intent: 'MCP_READ', path: targetPath });
+      const paths = extractPaths(combinedArgs);
+      if (paths.length > 0) {
+        actions.mcpReads.push(...paths);
+        paths.forEach(p => logTelemetry('parser.valid_action', { intent: 'MCP_READ', path: p }));
       } else {
         addFailed('MCP_READ', observed, 'missing_path', '[MCP_READ "file_name.txt"]');
       }
@@ -820,8 +1282,53 @@ function parseOutput(text) {
         logTelemetry('parser.help_requested', { scope: actionName.trim().toUpperCase() });
       }
     }
+
+    else if (intent === 'THINK_LEVEL') {
+      const match = combinedArgs.match(/(high|medium|light|low|глубоко|высокий|быстро|низкий|средне|средний)/i);
+      if (match) {
+        let rawLvl = match[1].toLowerCase();
+        let lvl = 'medium';
+        if (['high', 'глубоко', 'высокий'].includes(rawLvl)) lvl = 'high';
+        else if (['light', 'low', 'быстро', 'низкий'].includes(rawLvl)) lvl = 'light';
+        else lvl = 'medium';
+
+        actions.thinkLevel = lvl;
+        actions.feedback.executed.push({ intent: 'THINK_LEVEL', summary: `Reasoning effort set to ${lvl.toUpperCase()}` });
+        logTelemetry('parser.valid_action', { intent: 'THINK_LEVEL', level: lvl });
+      } else {
+        addFailed('THINK_LEVEL', observed, 'invalid_level', SUGGESTED.THINK_LEVEL);
+        addHelp('THINK_LEVEL');
+      }
+    }
+
     
+    else if (intent === 'USER_PROFILE') {
+      const userMatch = combinedArgs.match(/@([a-zA-Z0-9_]{3,})/);
+      const username = userMatch ? userMatch[1] : null;
+
+      let parsed = { ok: false };
+      const startBrace = combinedArgs.indexOf('{');
+      if (startBrace >= 0) {
+        parsed = lenientJsonParse(combinedArgs.substring(startBrace));
+      }
+
+      if (username && parsed.ok) {
+        actions.userProfiles.push({
+          username,
+          preferences: parsed.value.preferences || '',
+          notes: parsed.value.notes || parsed.value.content || ''
+        });
+        actions.feedback.executed.push({ intent: 'USER_PROFILE', summary: `Updated dossier for @${username}` });
+        logTelemetry('parser.valid_action', { intent: 'USER_PROFILE', username });
+      } else {
+        addFailed('USER_PROFILE', observed, 'missing_username_or_json', SUGGESTED.USER_PROFILE);
+        addHelp('USER_PROFILE');
+      }
+    }
+
     else {
+
+
       if (dynamicTags.includes(intent)) {
         const startBrace = combinedArgs.indexOf('{');
         let payload = {};
@@ -851,19 +1358,30 @@ function parseOutput(text) {
   }
   clearText = clearText.replace(/\s+/g, ' ').trim();
 
-  // Extract SELF_QUESTION and TOPIC_SCORE
+  // Extract SELF_QUESTION, TOPIC_SCORE, and RESOLVE_TOPIC
   actions.selfQuestion = null;
   actions.topicScore = null;
+  actions.resolveTopic = null;
 
-  const scoreMatch = normalized.match(/\[?TOPIC_SCORE[:\s]+(\d+)/i) || normalized.match(/topic\s*score[:\s]+(\d+)/i);
+  const scoreMatch = normalized.match(/\[?(?:TOPIC_SCORE|SCORE_TOPIC|RATE_TOPIC|INTEREST|TOPIC_RATING)[:\s]+(\d+)/i) || 
+                     normalized.match(/(?:topic\s*score|interest\s*score|topic\s*rating)[:\s]+(\d+)/i);
   if (scoreMatch) {
     actions.topicScore = Math.min(10, Math.max(1, parseInt(scoreMatch[1], 10)));
   }
 
-  const qMatch = normalized.match(/\[SELF_QUESTION\s+["']?([^\]"'\n]+)["']?\]/i) || normalized.match(/\[SELF_QUESTION\]\s*:?\s*([^\n]+)/i);
+  const qMatch = normalized.match(/\[(?:SELF_QUESTION|QUESTION|ASK_SELF|WONDER|INQUIRE|CURIOSITY)\s+(["'])(.*?)\1\]/i) || 
+                 normalized.match(/\[(?:SELF_QUESTION|QUESTION|ASK_SELF|WONDER|INQUIRE|CURIOSITY)\]\s*(["'])(.*?)\1/i) ||
+                 normalized.match(/(?:SELF_QUESTION|QUESTION|ASK_SELF|WONDER):\s*(["']?)([^"\n\r\[]+)\1/i);
   if (qMatch) {
-    actions.selfQuestion = qMatch[1].trim();
+    actions.selfQuestion = (qMatch[2] || qMatch[1]).trim();
   }
+
+  const resolveMatch = normalized.match(/\[(?:RESOLVE_TOPIC|TOPIC_DONE|RESOLVE|CLOSE_TOPIC)\s*(?:(["'])(.*?)\1|([^\]]*))\]/i);
+  if (resolveMatch) {
+    actions.resolveTopic = (resolveMatch[2] || resolveMatch[3] || 'Topic resolved').trim();
+  }
+
+
 
   // ========== HALLUCINATION PATTERN DETECTOR ==========
   // Runs on `normalized` (original text before tag-stripping) so it sees everything

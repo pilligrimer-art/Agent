@@ -23,6 +23,7 @@ try {
 // --- Состояние сессии ---
 const { parseOutput, logTelemetry } = require('./output_parser');
 const { scheduleNext, runSafely, clearScheduledRun, getSchedulerState } = require('./scheduler');
+const { evaluateOutboundSemanticDelta } = require('./fatigue_engine');
 
 // --- Убедиться что директории существуют ---
 function ensureDirs() {
@@ -66,26 +67,53 @@ const memState = {
   actionFeedback: null,
   totalRuns: 0,
   lastRunTime: null,
+  lastReplyLanguageMismatch: false, // true if last agent reply was wrong language vs last user msg
+  lastShownLtmId: null, // anti-repetition for scent-of-memory
   curiosity: {
     activeTopic: null,
     topicScore: 5,
-    lowScoreStreak: 0
-  }
+    lowScoreStreak: 0,
+    questionHistory: []
+  },
+  // Tracks consecutive cycles with no meaningful action (saves/deletes/msgs/questions/reflects).
+  // Used by the adaptive backoff scheduler: idle cycles exponentially increase sleep duration.
+  idleStreak: 0,
+  // Normalized texts of the last 50 agent messages sent to the user.
+  // Used for silent deduplication without injecting toxic [MALFORMED_INTENT] into context.
+  sentMessageHashes: [],
+  // Dynamic Chain of Thought (Thinking Effort): light | medium | high
+  currentThinkLevel: config.defaultThinkLevel || 'medium',
+  nextScheduledThinkLevel: null
 };
 
-function pushUserMessage(text, userId = null) {
+function pushUserMessage(text, userId = null, meta = {}) {
   if (userId) {
     memState.lastUserId = userId;
   }
-  const msg = { sender: 'user', time: new Date().toISOString(), text, userId };
+  const usernameMatch = text.match(/^\[Telegram @([^\]:\s]+)\]/);
+  const username = meta.username || (usernameMatch ? usernameMatch[1] : (userId ? `user_${userId}` : 'user'));
+  const msg = {
+    sender: 'user',
+    time: new Date().toISOString(),
+    text,
+    userId,
+    username,
+    messageId: meta.messageId || null,
+    replyToText: meta.replyToText || null,
+    isReplyToBot: meta.isReplyToBot || false,
+    answered: false
+  };
   memState.pendingMessages.push(msg);
   memState.chatHistory.push(msg);
   saveChatHistory();
-  console.log(`[USER] Новое сообщение: ${text.length > 30 ? text.substring(0, 30) + '...' : text}`);
+  mem.touchUserSeen(username, userId);
+  console.log(`[USER] Новое сообщение от @${username}${meta.replyToText ? ' (в ответ на вопрос бота)' : ''}: ${text.length > 40 ? text.substring(0, 40) + '...' : text}`);
+
   // Прерываем ожидание и заставляем агента подумать прямо сейчас
   clearScheduledRun();
   runSafely(runAgent);
 }
+
 
 function injectSystemMessage(text) {
   memState.pendingMessages.push({
@@ -119,30 +147,44 @@ function pickRedirectPrompt() {
   return REDIRECT_PROMPTS[Math.floor(Math.random() * REDIRECT_PROMPTS.length)];
 }
 
-// --- Запрос к Ollama ---
-async function callOllama(prompt) {
+// --- Запрос к Ollama с динамическим бюджетом токенов (thinkLevel) ---
+async function callOllama(prompt, thinkLevel = 'medium') {
   const url = `${config.ollamaHost.replace(/\/$/, '')}/api/generate`;
+  
+  // Динамический расчёт бюджета токенов на основе уровня рассуждения (Thinking Budget)
+  const budgetMap = {
+    light: config.thinkBudgetLight || 384,
+    medium: config.thinkBudgetMedium || 1024,
+    high: config.thinkBudgetHigh || 2048
+  };
+  const numPredict = budgetMap[thinkLevel] || config.maxTokens || 1024;
+
   const response = await axios.post(
     url,
     {
       model: config.modelName,
       prompt,
       stream: false,
-      think: false, // Disable thinking mode (Qwen 3.5+ safety)
-      options: { 
-        num_predict: config.maxTokens,
+      options: {
+        num_predict: numPredict,
         num_ctx: config.ollamaNumCtx,
-        temperature: config.temperature
+        temperature: config.temperature,
+        // Repetition control: penalises token reuse in the last repeat_last_n tokens.
+        // Complements the semantic loop detector which works at the sentence level.
+        repeat_penalty: config.repeatPenalty,
+        repeat_last_n: config.repeatLastN,
       }
     },
     { timeout: config.ollamaTimeout }
   );
+
 
   if (!response.data || typeof response.data.response !== 'string') {
     throw new Error('Ollama вернула неожиданный формат ответа.');
   }
   return response.data.response;
 }
+
 
 // --- Рефлексия: сжатие краткосрочной памяти в долгосрочную ---
 async function runReflection() {
@@ -370,8 +412,21 @@ async function executeActions(parsed, feedback) {
     }
   }
 
+  // User Profiles (Mem0 Layer)
+  for (const up of (parsed.userProfiles || [])) {
+    try {
+      mem.upsertUserProfile(up.username, up);
+      results.userProfiles = (results.userProfiles || 0) + 1;
+      feedback.executed.push({ intent: 'USER_PROFILE', summary: `Updated dossier for @${up.username}` });
+    } catch (err) {
+      results.blocked++;
+      logTelemetry('action.failed', { intent: 'USER_PROFILE', error: err.message });
+    }
+  }
+
   // MCP Tools
   for (const path of (parsed.mcpLists || [])) {
+
     const result = tools.mcpList(path);
     feedback.executed.push({ intent: 'MCP_LIST', summary: `Listed ${path}`, output: result });
   }
@@ -407,54 +462,92 @@ async function executeActions(parsed, feedback) {
   return results;
 }
 
-// --- Детектор когнитивных петель ---
+// --- Детектор когнитивных петель (мультипериодный кольцевой буфер) ---
+//
+// СОХРАНЕНО из исходной версии:
+//   - Memory Echo Loop детектор (h:xxxx / keywords)
+//   - Jaccard similarity (порог 0.75 → теперь задаётся через config.loopSimilarityThreshold)
+//   - Prefix/suffix word match (порог 0.8)
+//
+// ДОБАВЛЕНО:
+//   - normalizeForLoop(): нормализует типографские апострофы/кавычки → ASCII.
+//     Это устраняет главный механизм осцилляции ±1 символ (умный апостроф ' vs ASCII ').
+//   - Цикл по периодам p=1..4 вместо сравнения только с T-1.
+//     Обнаруживает петли вида A→B→A (период 2) и A→B→C→A (период 3).
+
+function normalizeForLoop(text) {
+  if (!text) return '';
+  return text
+    // Типографские апострофы и одиночные кавычки → ASCII '
+    .replace(/[\u2018\u2019\u201A\u201B\u0060]/g, "'")
+    // Типографские двойные кавычки → ASCII "
+    .replace(/[\u201C\u201D\u201E\u201F\u00AB\u00BB]/g, '"')
+    // Нулевые пробелы и BOM
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function _jaccardSimilarity(norm1, norm2) {
+  const getWords = (str) => new Set(str.split(/\s+/).filter(w => w.length > 2));
+  const words1 = getWords(norm1);
+  const words2 = getWords(norm2);
+  let intersection = 0;
+  for (const w of words1) { if (words2.has(w)) intersection++; }
+  const union = words1.size + words2.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
+function _prefixSuffixMatch(norm1, norm2, threshold = 0.8) {
+  const a = norm1.split(/\s+/);
+  const b = norm2.split(/\s+/);
+  const shorter = Math.min(a.length, b.length);
+  const longer = Math.max(a.length, b.length);
+  if (shorter <= 5) return false;
+
+  let prefix = 0;
+  while (prefix < shorter && a[prefix] === b[prefix]) prefix++;
+  if (prefix / longer > threshold) return true;
+
+  let suffix = 0;
+  while (suffix < shorter && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix++;
+  return suffix / longer > threshold;
+}
+
 function isLoopDetected(newThought, history) {
   if (!newThought) return false;
 
-  const normNew = newThought.trim().toLowerCase().replace(/\s+/g, ' ');
+  const normNew = normalizeForLoop(newThought);
 
-  // 4. Детектор повторений структуры карточек памяти (Memory Echo Loop)
+  // [СОХРАНЕНО] Детектор повторений структуры карточек памяти (Memory Echo Loop)
   const newHashes = (normNew.match(/\bh:[0-9a-f]{4}\b/g) || []).length;
   const newKeywords = (normNew.match(/\bkeywords\b/g) || []).length;
-  if (newHashes >= 2 || newKeywords >= 2) {
-    return true;
-  }
+  if (newHashes >= 2 || newKeywords >= 2) return true;
 
   if (!history || !history.length) return false;
-  const prev = history[history.length - 1];
-  if (!prev) return false;
-  
-  // 1. Точное или почти точное совпадение после нормализации пробелов и регистра
-  const normPrev = prev.trim().toLowerCase().replace(/\s+/g, ' ');
-  if (normNew === normPrev) return true;
 
-  // 2. Сходство на основе длины общего префикса
-  const shorter = Math.min(normNew.length, normPrev.length);
-  if (shorter > 0) {
-    let commonChars = 0;
-    for (let i = 0; i < shorter; i++) {
-      if (normNew[i] === normPrev[i]) commonChars++;
-      else break;
-    }
-    const maxLen = Math.max(normNew.length, normPrev.length);
-    // Относительно максимальной длины
-    if (commonChars / maxLen > 0.85) return true;
-    // Относительно предыдущей мысли (модель скопировала начало и дописала что-то)
-    if (commonChars > 40 && (commonChars / normPrev.length) > 0.85) return true;
-  }
+  // [НОВОЕ] Мультипериодная проверка: период 1, 2, 3, 4
+  // Позволяет обнаруживать A→B→A (период 2) и A→B→C→A (период 3),
+  // которые исходный детектор пропускал (сравнивал только A с B, видел разницу).
+  const maxPeriod = Math.min(config.loopRingBufferSize || 4, history.length);
+  const threshold = config.loopSimilarityThreshold || 0.78;
 
-  // 3. Фразовое/семантическое повторение: если более 75% предложений длиной > 20 символов
-  // из предыдущей мысли скопированы verbatim в новую мысль
-  const phrases = normPrev.split(/[.!?;]+/).map(p => p.trim()).filter(p => p.length > 20);
-  if (phrases.length > 0) {
-    let matchedPhrases = 0;
-    for (const phrase of phrases) {
-      if (normNew.includes(phrase)) {
-        matchedPhrases++;
-      }
-    }
-    const phraseRatio = matchedPhrases / phrases.length;
-    if (phraseRatio >= 0.75) return true;
+  for (let period = 1; period <= maxPeriod; period++) {
+    const pastIdx = history.length - period;
+    const past = history[pastIdx];
+    if (!past) continue;
+
+    const normPast = normalizeForLoop(past);
+
+    // Точное совпадение (после нормализации типографии и регистра)
+    if (normNew === normPast) return true;
+
+    // [СОХРАНЕНО] Jaccard similarity
+    if (_jaccardSimilarity(normNew, normPast) > threshold) return true;
+
+    // [СОХРАНЕНО] Общий префикс или суффикс по словам
+    if (_prefixSuffixMatch(normNew, normPast)) return true;
   }
 
   return false;
@@ -481,29 +574,70 @@ async function runAgent() {
   const messages = [...memState.pendingMessages];
   memState.pendingMessages = [];
 
-  const prompt = buildContext(
+  // Определение уровня рассуждений (Thinking Effort / Dynamic CoT) для текущего цикла
+  let effectiveThinkLevel = 'medium';
+  const hasDirectUserMessage = messages.some(m => m.sender === 'user');
+
+  if (hasDirectUserMessage) {
+    effectiveThinkLevel = 'high'; // Всегда глубокий анализ при новом сообщении от пользователя
+  } else if (memState.nextScheduledThinkLevel) {
+    effectiveThinkLevel = memState.nextScheduledThinkLevel;
+    memState.nextScheduledThinkLevel = null; // Сбрасываем после применения
+  } else if (memState.idleStreak >= 2) {
+    effectiveThinkLevel = 'light'; // Экономия токенов при холостом ходе
+  } else {
+    effectiveThinkLevel = config.defaultThinkLevel || 'medium';
+  }
+  memState.currentThinkLevel = effectiveThinkLevel;
+
+  const { prompt, lastShownLtmId: newLastShownLtmId, triageInfo, fatigueState } = buildContext(
     memState.thoughtHistory,
     messages,
     memState.consecutiveParseErrors,
     memState.requestedHelp,
     memState.focusItems.map(f => f.id),
     memState.actionFeedback,
-    memState.curiosity
+    memState.curiosity,
+    memState.chatHistory,
+    memState.lastShownLtmId,
+    effectiveThinkLevel
   );
+  if (newLastShownLtmId !== null) memState.lastShownLtmId = newLastShownLtmId;
+
+  if (fatigueState && fatigueState.state === 'EXHAUSTED') {
+    if (memState.curiosity && memState.curiosity.activeTopic) {
+      console.log(`[FATIGUE] 🥱 Семантическое насыщение (Fatigue: ${Math.round(fatigueState.fatigue * 100)}%). Сброс застрявшей темы: "${memState.curiosity.activeTopic.slice(0, 50)}..."`);
+      memState.curiosity.activeTopic = null;
+      memState.curiosity.topicScore = 0;
+    }
+  }
+
   let response = '';
   let parsed = null;
   let error = null;
-
+  let results = null;
+  let feedback = { executed: [], failed: [], blocked: [], hints: [] };
+  let actualSentCount = 0;
+  let blockedReasons = [];
+  let reflectionExecuted = false;
 
   try {
-    console.log(`[AGENT] Запрос к ${config.modelName}...`);
-    response = await callOllama(prompt);
+    console.log(`[AGENT] Запрос к ${config.modelName} (Think Level: ${effectiveThinkLevel.toUpperCase()})...`);
+    response = await callOllama(prompt, effectiveThinkLevel);
     console.log('[AGENT] Ответ получен.');
 
+
     parsed = parseOutput(response);
-    const feedback = parsed.feedback;
-    const results = await executeActions(parsed, feedback);
+    feedback = parsed.feedback;
+    results = await executeActions(parsed, feedback);
     console.log(`[AGENT] Сохранено: ${results.saved}, удалено: ${results.deleted}`);
+
+
+    // Учёт запланированного агентом уровня мышления на следующий цикл
+    if (parsed.thinkLevel) {
+      memState.nextScheduledThinkLevel = parsed.thinkLevel;
+      console.log(`[AGENT] 🧠 Запланирован уровень рассуждения на следующий цикл: ${parsed.thinkLevel.toUpperCase()}`);
+    }
 
     // Детекция символов '+++' или '---' в любом месте размышления или ответа модели
     const fullOutputText = response || '';
@@ -511,33 +645,77 @@ async function runAgent() {
     if (fullOutputText.includes('+++')) symbol = '+';
     else if (fullOutputText.includes('---')) symbol = '-';
 
+
     if (symbol && memState.lastUserId) {
       telegramBridge.recordModelChoice(symbol, memState.lastUserId);
     }
 
+    // Обработка разрешения и закрытия исследовательской темы
+    if (parsed.resolveTopic) {
+      console.log(`[CURIOSITY] 🏁 Тема завершена: "${parsed.resolveTopic}"`);
+      if (!feedback.executed) feedback.executed = [];
+      feedback.executed.push({ intent: 'RESOLVE_TOPIC', summary: `Resolved: ${parsed.resolveTopic.slice(0, 60)}` });
+      
+      if (memState.curiosity.activeTopic) {
+        mem.addLong(
+          'fact',
+          `[Research Conclusion]: "${memState.curiosity.activeTopic}" -> ${parsed.resolveTopic}`,
+          '#research,#conclusion,#synthesis',
+          'cognitive_resolution'
+        );
+      }
+
+      memState.curiosity.activeTopic = null;
+      memState.curiosity.topicScore = 0;
+      memState.curiosity.inquiryStep = 1;
+    }
+
     // Обработка автономного самовопроса и оценки темы
     if (parsed.selfQuestion) {
-      memState.curiosity.activeTopic = parsed.selfQuestion;
-      memState.curiosity.lowScoreStreak = 0;
-      console.log(`[CURIOSITY] 💡 Новая самостоятельная тема: "${parsed.selfQuestion}"`);
+      if (isLoopDetected(parsed.selfQuestion, memState.curiosity.questionHistory)) {
+        console.warn(`[CURIOSITY] 🔄 Дубликат самовопроса отклонен: "${parsed.selfQuestion.slice(0, 50)}..."`);
+        parsed.topicScore = null; // Prevent score update on duplicate
+        injectSystemMessage(`[MALFORMED_INTENT "duplicate_self_question"] You repeated the exact same question. Advance to the next phase of your research or choose a fresh topic.`);
+      } else {
+        memState.curiosity.activeTopic = parsed.selfQuestion;
+        memState.curiosity.inquiryStep = 1;
+        memState.curiosity.maxInquirySteps = 4;
+        memState.curiosity.lowScoreStreak = 0;
+        memState.curiosity.questionHistory.push(parsed.selfQuestion);
+        if (memState.curiosity.questionHistory.length > 5) {
+          memState.curiosity.questionHistory.shift();
+        }
+        console.log(`[CURIOSITY] 💡 Новая исследовательская тема (Шаг 1/4): "${parsed.selfQuestion}"`);
+      }
+    } else if (memState.curiosity.activeTopic && !parsed.resolveTopic) {
+      // Продвижение по шагам исследования (1 -> 2 -> 3 -> 4)
+      memState.curiosity.inquiryStep = (memState.curiosity.inquiryStep || 1) + 1;
+      console.log(`[CURIOSITY] 🔬 Продвижение исследования "${memState.curiosity.activeTopic.slice(0, 35)}..." (Шаг ${memState.curiosity.inquiryStep}/4)`);
+      if (memState.curiosity.inquiryStep > 4) {
+        console.log(`[CURIOSITY] 🏁 Тема исследована в течение 4 шагов. Авто-завершение и освобождение фокуса.`);
+        memState.curiosity.activeTopic = null;
+        memState.curiosity.inquiryStep = 1;
+      }
     }
 
     if (parsed.topicScore !== null) {
       memState.curiosity.topicScore = parsed.topicScore;
       console.log(`[CURIOSITY] 📊 Оценка интереса к теме: ${parsed.topicScore}/10`);
       
-      if (parsed.topicScore <= 4) {
+      if (parsed.topicScore <= 3) {
         memState.curiosity.lowScoreStreak += 1;
-        console.log(`[CURIOSITY] 📉 Низкий интерес (${parsed.topicScore}/10). Серия низкого интереса: ${memState.curiosity.lowScoreStreak}/3`);
-        if (memState.curiosity.lowScoreStreak >= 3) {
-          console.log(`[CURIOSITY] 🔄 Интерес угас 3 цикла подряд (<=4/10). Сброс текущей темы для генерации новой!`);
+        console.log(`[CURIOSITY] 📉 Низкий интерес (${parsed.topicScore}/10). Серия низкого интереса: ${memState.curiosity.lowScoreStreak}/5`);
+        if (memState.curiosity.lowScoreStreak >= 5) {
+          console.log(`[CURIOSITY] 🔄 Интерес угас 5 циклов подряд (<=3/10). Сброс текущей темы для генерации новой!`);
           memState.curiosity.activeTopic = null;
           memState.curiosity.lowScoreStreak = 0;
+          memState.curiosity.inquiryStep = 1;
         }
       } else {
         memState.curiosity.lowScoreStreak = 0;
       }
     }
+
     
     memState.totalRuns++;
     memState.lastRunTime = new Date().toISOString();
@@ -555,13 +733,147 @@ async function runAgent() {
 
     // Обработка сообщений от агента
     if (parsed.messages && parsed.messages.length > 0) {
+
       let maxPunctuation = 0;
       let hasQuestion = false;
 
+      const recentAgentMsgs = memState.chatHistory
+        .filter(m => m.sender === 'agent')
+        .slice(-3)
+        .map(m => m.text);
+
+      // For duplicate detection we also use the persistent cross-cycle buffer (sentMessageHashes).
+      // This catches duplicates that slip through if the chat history window is short.
+      const dedupHistory = [
+        ...recentAgentMsgs,
+        ...memState.sentMessageHashes.slice(-20)
+      ];
+
+      let hasUnansweredUser = false;
+      let lastUserIdx = -1;
+      let lastAgentIdx = -1;
+      let lastUserMsgText = '';
+      for (let i = memState.chatHistory.length - 1; i >= 0; i--) {
+        if (lastUserIdx === -1 && memState.chatHistory[i].sender === 'user') {
+          lastUserIdx = i;
+          lastUserMsgText = memState.chatHistory[i].text;
+        }
+        if (lastAgentIdx === -1 && memState.chatHistory[i].sender === 'agent') lastAgentIdx = i;
+      }
+      if (lastUserIdx > lastAgentIdx) {
+        hasUnansweredUser = true;
+      }
+
+      const TAG_LEAK_PATTERN = /\[(SELF_QUESTION|SEND_MESSAGE|MEM_SAVE|MEM_FOCUS|TOPIC_SCORE|REFLECT|SCHEDULE)\b/i;
+
       for (const msgText of parsed.messages) {
+        // Guard 0: tag leaked into message text
+        if (TAG_LEAK_PATTERN.test(msgText)) {
+          console.warn(`[AGENT] ⛔ Тег в сообщении заблокирован: tag_leaked_into_message`);
+          injectSystemMessage(`[MALFORMED_INTENT "tag_leaked_into_message"] Your SEND_MESSAGE argument contains a raw tool tag (e.g. [SELF_QUESTION ...]). Send plain text only — no brackets, no tags.`);
+          blockedReasons.push('tag_leaked_into_message');
+          continue;
+        }
+
+        // Guard 1: duplicate send — SILENT suppression (no MALFORMED_INTENT injected).
+        // Rationale: injecting "[MALFORMED_INTENT duplicate_send_message] You are repeating..."
+        // puts the words "repeating", "same", "message" at high salience in context — exactly
+        // the tokens that prime the next generation toward... the same message.
+        // Instead we silently drop it and record a blocked entry in actionFeedback so the
+        // agent sees "blocked: duplicate_send_message" in the next [ACTION FEEDBACK] block,
+        // which is neutral and informative without polluting the attention window.
+        if (isLoopDetected(msgText, dedupHistory)) {
+          console.warn(`[AGENT] 🔇 Дубликат сообщения тихо подавлен: "${msgText.slice(0, 60)}..."`);
+          blockedReasons.push('duplicate_send_message');
+          // Записать в feedback следующего цикла нейтрально (агент увидит в [ACTION FEEDBACK])
+          if (results) {
+            if (!results.blockedSends) results.blockedSends = [];
+            results.blockedSends.push({ reason: 'duplicate_send_message', preview: msgText.slice(0, 60) });
+          }
+          continue;
+        }
+
+        // Guard 1.5: Outbound Semantic Delta & Intent Diversity Guard
+        // Если в этом цикле не поступило нового сообщения от пользователя, проверяем смысловую новизну:
+        // Агент может свободно отправлять сообщения, если они несут РАЗНУЮ смысловую нагрузку (новые вопросы, факты, темы),
+        // но перефразирование одного и того же совета (семантическое эхо) тихо подавляется.
+        if (messages.length === 0) {
+          const recentAgentMsgs = memState.chatHistory
+            .filter(m => m.sender === 'agent')
+            .slice(-4)
+            .map(m => m.text);
+
+          const delta = evaluateOutboundSemanticDelta(msgText, recentAgentMsgs);
+          if (!delta.isNovel) {
+            console.warn(`[AGENT] 🔇 Семантическое эхо предотвращено (${Math.round(delta.overlap * 100)}% совпадения): "${msgText.slice(0, 60)}..."`);
+            blockedReasons.push('semantic_echo');
+            if (results) {
+              if (!results.blockedSends) results.blockedSends = [];
+              results.blockedSends.push({ reason: 'semantic_echo', preview: msgText.slice(0, 60), overlap: delta.overlap });
+            }
+            continue;
+          }
+        }
+
+        // Guard 2: language mismatch
+
+        if (hasUnansweredUser) {
+          const cyrillicMatchUser = lastUserMsgText.match(/[\u0400-\u04FF]/g);
+          const cyrillicRatioUser = cyrillicMatchUser ? cyrillicMatchUser.length / lastUserMsgText.length : 0;
+          const cyrillicMatchAgent = msgText.match(/[\u0400-\u04FF]/g);
+          const cyrillicRatioAgent = cyrillicMatchAgent ? cyrillicMatchAgent.length / msgText.length : 0;
+
+          if (cyrillicRatioUser > 0.35 && cyrillicRatioAgent < 0.05) {
+            console.warn(`[AGENT] ⛔ Языковой барьер: ответ заблокирован (ожидалась кириллица).`);
+            injectSystemMessage(`[MALFORMED_INTENT "irrelevant_language"] The user spoke in Russian (Cyrillic). You MUST reply in Russian. Do NOT use English for [SEND_MESSAGE].`);
+            blockedReasons.push('irrelevant_language');
+            memState.lastReplyLanguageMismatch = true;
+            continue;
+          } else if (cyrillicRatioUser < 0.05 && cyrillicRatioAgent > 0.25) {
+            console.warn(`[AGENT] ⛔ Языковой барьер: ответ заблокирован (ожидался английский).`);
+            injectSystemMessage(`[MALFORMED_INTENT "irrelevant_language"] The user spoke in English. You MUST reply in English. Do NOT use Russian for [SEND_MESSAGE].`);
+            blockedReasons.push('irrelevant_language');
+            memState.lastReplyLanguageMismatch = true;
+            continue;
+          } else {
+            memState.lastReplyLanguageMismatch = false;
+          }
+        }
+
+        // All guards passed — actually send
         memState.chatHistory.push({ sender: 'agent', time: new Date().toISOString(), text: msgText });
         console.log(`[AGENT -> USER] ${msgText}`);
         telegramBridge.sendMessage(msgText);
+        actualSentCount++;
+        memState.lastReplyLanguageMismatch = false; // successful send clears mismatch flag
+
+        // Target user resolution: check if reply mentions @username or reply addresses pending inquiry
+        const targetUserMatch = msgText.match(/@([a-zA-Z0-9_]{3,})/);
+        if (targetUserMatch) {
+          const targetUsername = targetUserMatch[1].toLowerCase();
+          for (let i = memState.chatHistory.length - 1; i >= 0; i--) {
+            const m = memState.chatHistory[i];
+            if (m.sender === 'user' && !m.answered && (m.username?.toLowerCase() === targetUsername || m.text?.toLowerCase().includes(`@${targetUsername}`))) {
+              m.answered = true;
+              if (m.userId) memState.lastUserId = m.userId;
+              break;
+            }
+          }
+        } else {
+          // Mark latest unanswered user message as answered
+          for (let i = memState.chatHistory.length - 1; i >= 0; i--) {
+            const m = memState.chatHistory[i];
+            if (m.sender === 'user' && !m.answered) {
+              m.answered = true;
+              if (m.userId) memState.lastUserId = m.userId;
+              break;
+            }
+          }
+        }
+
+        // Register in persistent dedup buffer (keep last 50 messages)
+        memState.sentMessageHashes.push(normalizeForLoop(msgText));
+        if (memState.sentMessageHashes.length > 50) memState.sentMessageHashes.shift();
 
         if (msgText.includes('?')) {
           hasQuestion = true;
@@ -572,6 +884,7 @@ async function runAgent() {
         }
       }
       saveChatHistory();
+
 
       // Вычисление задержки планировщика:
       // - Любое обычное сообщение в чат -> 30 секунд
@@ -588,11 +901,37 @@ async function runAgent() {
         const typeStr = hasQuestion ? (maxPunctuation > 2 ? 'Сложный вопрос' : 'Простой вопрос') : 'Обычное сообщение';
         console.log(`[SCHEDULER] ⏱️ ${typeStr} отправлено в чат. Таймер сна: ${messageTimerSec}с (знаков препинания: ${maxPunctuation}).`);
       }
+    } else {
+      // ПРОВЕРКА НА ИГНОРИРОВАНИЕ ПОЛЬЗОВАТЕЛЯ
+      let hasUnansweredUser = false;
+      let lastUserIdx = -1;
+      let lastAgentIdx = -1;
+      for (let i = memState.chatHistory.length - 1; i >= 0; i--) {
+        if (lastUserIdx === -1 && memState.chatHistory[i].sender === 'user') lastUserIdx = i;
+        if (lastAgentIdx === -1 && memState.chatHistory[i].sender === 'agent') lastAgentIdx = i;
+      }
+      if (lastUserIdx > lastAgentIdx) {
+        hasUnansweredUser = true;
+      }
+
+      // Persistent language mismatch: also force reply if last reply was wrong language
+      const needsCorrectReply = hasUnansweredUser || memState.lastReplyLanguageMismatch;
+
+      if (needsCorrectReply) {
+        // Exception: do not force reply for very short acknowledgements ("ок", "👍", etc.)
+        const lastUserMsg = memState.chatHistory.slice().reverse().find(m => m.sender === 'user');
+        const isShortAck = lastUserMsg && lastUserMsg.text.trim().split(/\s+/).length < 5 && !lastUserMsg.text.includes('?');
+
+        if (!isShortAck) {
+          injectSystemMessage(`[MALFORMED_INTENT "missing_reply"] You must reply to the user using [SEND_MESSAGE]. Do not ignore the user.`);
+          results.errors.push('Ignored user message');
+        }
+      }
     }
 
-    let reflectionExecuted = false;
     let reflectionBlocked = false;
     if (parsed.reflect) {
+
       const nowMs = Date.now();
       if (nowMs - memState.lastReflectTime < 3 * 60 * 1000) {
         console.warn('[AGENT] Запуск рефлексии проигнорирован (с прошлого раза прошло менее 3 минут).');
@@ -616,10 +955,18 @@ async function runAgent() {
       feedback.executed.push({ intent: 'SCHEDULE', summary: `Scheduled ${rawScheduleSec}s (raw, clamped by scheduler)` });
     }
 
-    // Message feedback
+    // Message feedback — report actual sent vs intended
     if (parsed.messages && parsed.messages.length > 0) {
-      feedback.executed.push({ intent: 'SEND_MESSAGE', summary: `Sent ${parsed.messages.length} message(s)` });
+      if (actualSentCount > 0) {
+        if (!feedback.executed) feedback.executed = [];
+        feedback.executed.push({ intent: 'SEND_MESSAGE', summary: `Sent ${actualSentCount} of ${parsed.messages.length} message(s)` });
+      } else {
+        const reasons = blockedReasons.length > 0 ? blockedReasons.join(', ') : 'unknown guard';
+        if (!feedback.blocked) feedback.blocked = [];
+        feedback.blocked.push({ intent: 'SEND_MESSAGE', summary: `Blocked ${parsed.messages.length} message(s): ${reasons}` });
+      }
     }
+
 
     // Обновление фокуса
     for (let i = memState.focusItems.length - 1; i >= 0; i--) {
@@ -674,7 +1021,7 @@ async function runAgent() {
 
     // Detailed granular telemetry counters
     const repaired_total = parsed.repairedCount || 0;
-    const parsed_total = 
+    const parsed_total =
       parsed.saves.length +
       parsed.deletes.length +
       parsed.adapts.length +
@@ -687,7 +1034,7 @@ async function runAgent() {
       (parsed.reflect ? 1 : 0) +
       (parsed.scheduleSecParsed ? 1 : 0);
 
-    const executed_total = 
+    const executed_total =
       results.saved +
       results.deleted +
       results.adapts +
@@ -700,7 +1047,7 @@ async function runAgent() {
       (reflectionExecuted ? 1 : 0) +
       (parsed.scheduleSecParsed ? 1 : 0);
 
-    const blocked_total = 
+    const blocked_total =
       parsed.feedback.failed.length +
       results.blocked +
       (reflectionBlocked ? 1 : 0);
@@ -751,10 +1098,50 @@ async function runAgent() {
     console.error(`[AGENT] Ошибка: ${error}`);
   }
 
+  // ── Адаптивный backoff при холостом ходе ──────────────────────────────────────
+  // Холостой цикл = цикл без сохранений/удалений памяти, без отправки сообщений,
+  // без рефлексий, без своих вопросов. Каждый такой цикл удваивает паузу до maxSleep.
+  // Устраняет паттерн «10 секунд бесконечно» (35 серий, до 18 подряд — из аудита).
+  const hadAction = Boolean(
+    (results && results.saved > 0) ||
+    (results && results.deleted > 0) ||
+    (results && results.adapts > 0) ||
+    actualSentCount > 0 ||
+    (parsed && parsed.selfQuestion) ||
+    reflectionExecuted
+  );
+
+  if (hadAction) {
+    if (memState.idleStreak > 0) {
+      console.log(`[SCHEDULER] ✅ Действие выполнено. Сброс idle streak (было ${memState.idleStreak}).`);
+    }
+    memState.idleStreak = 0;
+  } else {
+    memState.idleStreak++;
+  }
+
   // Планирование следующего запуска — scheduler клампит один раз через clampSchedule()
   let appliedScheduleInfo = { appliedDelaySec: config.defaultIntervalSec, nextAt: null };
-  // rawScheduleSec может быть undefined если произошла ошибка — fallback к defaultIntervalSec
-  const finalScheduleSec = (parsed && parsed.scheduleSec != null) ? parsed.scheduleSec : config.defaultIntervalSec;
+
+  // Приоритет 1: агент явно поставил [SCHEDULE N]
+  let finalScheduleSec = (parsed && parsed.scheduleSecParsed && parsed.scheduleSec != null)
+    ? parsed.scheduleSec
+    : null;
+
+  // Приоритет 2: адаптивный backoff при холостом ходе (агент не ставил SCHEDULE)
+  if (finalScheduleSec == null && memState.idleStreak > 0) {
+    const base = config.idleBackoffBaseSec || 15;
+    const cap  = config.idleBackoffMaxSec  || 600;
+    finalScheduleSec = Math.min(cap, base * Math.pow(2, memState.idleStreak - 1));
+    console.log(`[SCHEDULER] 💤 Холостой цикл #${memState.idleStreak}. Адаптивный сон: ${finalScheduleSec}с`);
+    logTelemetry('agent.idle_backoff', { streak: memState.idleStreak, sleep: finalScheduleSec });
+  }
+
+  // Приоритет 3: дефолтный интервал
+  if (finalScheduleSec == null) {
+    finalScheduleSec = config.defaultIntervalSec;
+  }
+
   if (process.env.RUN_ONCE === '1') {
     console.log(`[AGENT] Режим одного запуска. Следующий был бы через ${finalScheduleSec}с.`);
   } else {
@@ -780,8 +1167,8 @@ function main() {
   console.log(`[AGENT] Записей в STM: ${mem.countShort()}, LTM: ${mem.countLong()}`);
   mem.initBaseAdaptations();
 
-  telegramBridge.startPolling((userInputText) => {
-    pushUserMessage(userInputText);
+  telegramBridge.startPolling((userInputText, userId) => {
+    pushUserMessage(userInputText, userId);
   });
 
   runSafely(runAgent);

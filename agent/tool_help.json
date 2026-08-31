@@ -68,5 +68,13 @@
     "valid_example": "[MCP_READ \"config.json\"]",
     "common_mistake": "Do not request paths outside of your workspace sandbox.",
     "related_tool_if_confused": "If you want to see what files exist, use [MCP_LIST]"
+  },
+  "THINK_LEVEL": {
+    "purpose": "Set your thinking depth and reasoning token budget for the next cycle (high, medium, light).",
+    "exact_syntax": "[THINK_LEVEL \"high\"|\"medium\"|\"light\"]",
+    "valid_example": "[THINK_LEVEL \"high\"]",
+    "common_mistake": "Use only 'high', 'medium', or 'light'.",
+    "related_tool_if_confused": "If you want to control cycle sleep delay instead, use [SCHEDULE seconds]"
   }
 }
+

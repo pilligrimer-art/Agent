@@ -145,6 +145,12 @@ app.listen(PORT, '127.0.0.1', async () => {
   console.log('[SYSTEM] Инициализация агента...');
   mem.initBaseAdaptations();
   
+  const telegramBridge = require('./agent/telegram_bridge');
+  telegramBridge.startPolling((userInputText, userId, meta) => {
+    pushUserMessage(userInputText, userId, meta);
+  });
+  
   const { runSafely } = require('./agent/scheduler');
   await runSafely(runAgent);
 });
+

@@ -174,71 +174,32 @@ class TelegramBridge {
       console.log(`[TELEGRAM] ✅ Авто-определение Chat ID: ${this.chatId}`);
     }
 
-    // 1. Новое сообщение от пользователя (игнорируем собственные сообщения бота)
+    // 1. Новое сообщение от пользователя (пропускаем все сообщения без задержек и очередей)
     if (msg && msg.from && !msg.from.is_bot) {
       const text = msg.text || '';
       const replyTo = msg.reply_to_message;
       const user = msg.from.username || msg.from.first_name || 'User';
       const userId = msg.from.id;
-      const nowMs = Date.now();
+      const replyToText = (replyTo && replyTo.text) ? replyTo.text : null;
+      const isReplyToBot = Boolean(replyTo && replyTo.from && (replyTo.from.is_bot || replyTo.from.id !== msg.from.id));
 
-      let streakState = this.userStreakMap.get(userId) || { plusStreak: 0, minusStreak: 0, cooldownUntil: 0, bonusTokens: 0 };
-
-      // Проверка 5-минутного бана после 3-х минусов подряд
-      if (streakState.cooldownUntil > nowMs) {
-        const remainingSec = Math.ceil((streakState.cooldownUntil - nowMs) / 1000);
-        console.log(`[TELEGRAM GATE] ⛔ Сообщение от @${user} заблокировано (активен 5-мин бан после 3-х минусов, осталось ${remainingSec}с).`);
-        return;
+      if (text.trim() && this.onUserInputCallback) {
+        console.log(`[TELEGRAM] 📥 Входящее сообщение от @${user}${replyToText ? ' (в ответ на вопрос бота)' : ''}: "${text}"`);
+        this.onUserInputCallback(
+          `[Telegram @${user}]: ${text}`,
+          userId,
+          {
+            username: user,
+            messageId: msg.message_id,
+            chatId: msg.chat.id,
+            replyToText,
+            isReplyToBot
+          }
+        );
       }
-
-      if (replyTo) {
-        this.pendingUserReplies.set(msg.message_id, {
-          text,
-          user,
-          replyToMsgId: replyTo.message_id,
-          chatId: msg.chat.id
-        });
-      }
-
-      // Проверка Бонусных Токенов (после 3-х плюсов подряд)
-      if (streakState.bonusTokens > 0 && text.trim()) {
-        streakState.bonusTokens -= 1;
-        this.userStreakMap.set(userId, streakState);
-        console.log(`[TELEGRAM GATE] 🎁 Использован 1 Бонусный Токен от @${user} (осталось бонусов: ${streakState.bonusTokens})`);
-        if (this.onUserInputCallback) {
-          this.onUserInputCallback(`[Telegram @${user}]: ${text}`, userId);
-        }
-        return;
-      }
-
-      const lastUserTime = this.userRateLimitMap.get(userId) || 0;
-      const TWO_MINUTES_MS = 2 * 60 * 1000;
-      const isReplyToBot = replyTo && replyTo.from && (replyTo.from.id === msg.from.id || replyTo.from.is_bot);
-      const isReplyToQuestion = isReplyToBot && replyTo.text && replyTo.text.includes('?');
-      const isUserTokenAvailable = (nowMs - lastUserTime) >= TWO_MINUTES_MS;
-
-      // Шлюз 1: Персональный 2-минутный токен пользователя
-      if (isUserTokenAvailable && text.trim()) {
-        this.userRateLimitMap.set(userId, nowMs);
-        console.log(`[TELEGRAM GATE] 🎟️ Персональный 2-мин токен пользователя @${user} использован: "${text}"`);
-        if (this.onUserInputCallback) {
-          this.onUserInputCallback(`[Telegram @${user}]: ${text}`, userId);
-        }
-        return;
-      }
-
-      // Шлюз 2: Проверка Вопросительной Квоты ИЛИ прямого ответа на вопрос '?'
-      if ((this.questionQuota > 0 || isReplyToQuestion) && text.trim()) {
-        if (this.questionQuota > 0) this.questionQuota -= 1;
-        console.log(`[TELEGRAM GATE] ❓ Ответ пропущен по квоте вопроса от @${user}: "${text}"`);
-        if (this.onUserInputCallback) {
-          this.onUserInputCallback(`[Telegram @${user}]: ${text}`, userId);
-        }
-        return;
-      }
-
-      // Шлюз 3: Ожидание 3+ реакций (отработка в processReactionGate)
+      return;
     }
+
 
     // 2. Реакция на сообщение (message_reaction или message_reaction_count)
     if (update.message_reaction) {
@@ -267,10 +228,11 @@ class TelegramBridge {
       console.log(`[TELEGRAM GATE] Сообщение @${reply.user} набрало ${count} реакций! Пропуск в контекст агента: "${reply.text}"`);
       this.pendingUserReplies.delete(msgId);
       if (this.onUserInputCallback) {
-        this.onUserInputCallback(`[Telegram @${reply.user} (3+ reactions)]: ${reply.text}`, reply.chatId);
+        this.onUserInputCallback(`[Telegram @${reply.user} (3+ reactions)]: ${reply.text}`, reply.chatId, { username: reply.user, messageId: msgId, chatId: reply.chatId });
       }
     }
   }
+
 
   recordModelChoice(symbol, userId) {
     if (!userId) return;

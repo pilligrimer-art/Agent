@@ -98,6 +98,49 @@ const stmtWeakenAdaptation = db.prepare(`
 
 const stmtCountAdaptations = db.prepare('SELECT COUNT(*) AS cnt FROM adaptations');
 
+// --- User Profiles (Mem0 Layer) Prepared Statements ---
+const stmtGetUserProfile = db.prepare('SELECT * FROM user_profiles WHERE username = ? COLLATE NOCASE');
+
+const stmtUpsertUserProfile = db.prepare(`
+  INSERT INTO user_profiles (username, user_id, preferences, notes, interaction_count, last_seen, updated_at)
+  VALUES (@username, @user_id, @preferences, @notes, 1, datetime('now'), datetime('now'))
+  ON CONFLICT(username) DO UPDATE SET
+    user_id = COALESCE(@user_id, user_profiles.user_id),
+    preferences = CASE WHEN @preferences != '' THEN @preferences ELSE user_profiles.preferences END,
+    notes = CASE WHEN @notes != '' THEN @notes ELSE user_profiles.notes END,
+    interaction_count = user_profiles.interaction_count + 1,
+    last_seen = datetime('now'),
+    updated_at = datetime('now')
+`);
+
+const stmtTouchUserSeen = db.prepare(`
+  INSERT INTO user_profiles (username, user_id, interaction_count, last_seen, updated_at)
+  VALUES (@username, @user_id, 1, datetime('now'), datetime('now'))
+  ON CONFLICT(username) DO UPDATE SET
+    user_id = COALESCE(@user_id, user_profiles.user_id),
+    interaction_count = user_profiles.interaction_count + 1,
+    last_seen = datetime('now'),
+    updated_at = datetime('now')
+`);
+
+const stmtGetRecentUserProfiles = db.prepare('SELECT * FROM user_profiles ORDER BY last_seen DESC LIMIT ?');
+
+// --- HippoRAG Light (Concept Graph) Prepared Statements ---
+const stmtLinkConcepts = db.prepare(`
+  INSERT INTO concept_links (concept_a, concept_b, weight, updated_at)
+  VALUES (@concept_a, @concept_b, @weight, datetime('now'))
+  ON CONFLICT(concept_a, concept_b) DO UPDATE SET
+    weight = MIN(10.0, concept_links.weight + @weight),
+    updated_at = datetime('now')
+`);
+
+const stmtGetNeighbors = db.prepare(`
+  SELECT concept_b AS concept, weight FROM concept_links WHERE concept_a = ?
+  UNION
+  SELECT concept_a AS concept, weight FROM concept_links WHERE concept_b = ?
+  ORDER BY weight DESC LIMIT ?
+`);
+
 // --- CRUD-функции (все синхронные) ---
 
 /**
@@ -121,18 +164,25 @@ function addShort(type, content, priority = 'normal', expires = null) {
 /**
  * Добавить запись в долгосрочную память.
  * Триггер long_mem_ai автоматически обновит FTS5 индекс.
+ * Автоматически связывает концепты в HippoRAG графе.
  * @returns {{ id: number }} вставленная запись
  */
 function addLong(type, content, tags = '', source = null) {
   const tagsStr = Array.isArray(tags) ? tags.join(',') : String(tags || '');
+  const cleanContent = String(content).trim();
   const info = stmtAddLong.run({
     type:    type || 'insight',
-    content: String(content).trim(),
+    content: cleanContent,
     tags:    tagsStr,
     source:  source || null
   });
-  return { id: info.lastInsertRowid, type, content: String(content).trim(), tags: tagsStr };
+
+  // Автоматическое построение графа связей концептов
+  recordMemoryConcepts(tagsStr, cleanContent);
+
+  return { id: info.lastInsertRowid, type, content: cleanContent, tags: tagsStr };
 }
+
 
 /**
  * Удалить запись из краткосрочной памяти.
@@ -290,6 +340,17 @@ function archiveExpiredShortMem(maxCycles = 4) {
     // Select and auto-archive entries that exceeded cycles limit
     const expired = db.prepare("SELECT * FROM short_mem WHERE cycles >= ? AND type != 'plan'").all(maxCycles);
     for (const entry of expired) {
+      // Enforce LTM auto_archive quota: max 20 entries. Evict oldest first.
+      const AUTO_ARCHIVE_LTM_QUOTA = 20;
+      const autoArchiveCount = db.prepare("SELECT COUNT(*) as cnt FROM long_mem WHERE tags LIKE 'auto_archive%'").get();
+      if (autoArchiveCount && autoArchiveCount.cnt >= AUTO_ARCHIVE_LTM_QUOTA) {
+        const oldest = db.prepare("SELECT id FROM long_mem WHERE tags LIKE 'auto_archive%' ORDER BY created ASC LIMIT 1").get();
+        if (oldest) {
+          db.prepare('DELETE FROM long_mem WHERE id = ?').run(oldest.id);
+          console.log(`[MEM] LTM auto_archive quota exceeded (${AUTO_ARCHIVE_LTM_QUOTA}). Evicted oldest entry #${oldest.id}.`);
+        }
+      }
+
       addLong(
         entry.type,
         entry.content,
@@ -304,9 +365,21 @@ function archiveExpiredShortMem(maxCycles = 4) {
   }
 }
 
-function getRandomLongMem() {
+function getRandomLongMem(lastShownId = null) {
   try {
-    return db.prepare('SELECT * FROM long_mem ORDER BY RANDOM() LIMIT 1').get();
+    // 40% chance to exclude auto_archive entries to reduce self-referential priming
+    const excludeAutoArchive = Math.random() < 0.4;
+    
+    // Build base query excluding the last shown entry to prevent immediate repetition
+    const excludeClause = lastShownId ? `AND id != '${lastShownId}'` : '';
+    
+    if (excludeAutoArchive) {
+      const row = db.prepare(`SELECT * FROM long_mem WHERE tags NOT LIKE 'auto_archive%' ${excludeClause} ORDER BY RANDOM() LIMIT 1`).get();
+      if (row) return row;
+    }
+    // Fallback: any entry except last shown
+    const row = db.prepare(`SELECT * FROM long_mem WHERE 1=1 ${excludeClause} ORDER BY RANDOM() LIMIT 1`).get();
+    return row || db.prepare('SELECT * FROM long_mem ORDER BY RANDOM() LIMIT 1').get();
   } catch (_) {
     return null;
   }
@@ -424,6 +497,109 @@ function getRecallMemory(limit = 50) {
   return [];
 }
 
+// ── User Profiles (Mem0 Layer) Functions ─────────────────────────────────────
+
+function getUserProfile(username) {
+  if (!username) return null;
+  const cleanUsername = username.replace(/^@/, '').trim();
+  try {
+    return stmtGetUserProfile.get(cleanUsername) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function upsertUserProfile(username, data = {}) {
+  if (!username) return null;
+  const cleanUsername = username.replace(/^@/, '').trim();
+  try {
+    stmtUpsertUserProfile.run({
+      username: cleanUsername,
+      user_id: data.user_id || data.userId || null,
+      preferences: data.preferences || '',
+      notes: data.notes || ''
+    });
+    return getUserProfile(cleanUsername);
+  } catch (err) {
+    console.error('[MEM] Error upserting user profile:', err.message);
+    return null;
+  }
+}
+
+function touchUserSeen(username, userId = null) {
+  if (!username) return;
+  const cleanUsername = username.replace(/^@/, '').trim();
+  try {
+    stmtTouchUserSeen.run({
+      username: cleanUsername,
+      user_id: userId || null
+    });
+  } catch (_) {}
+}
+
+function getRecentUserProfiles(limit = 10) {
+  try {
+    return stmtGetRecentUserProfiles.all(limit);
+  } catch (_) {
+    return [];
+  }
+}
+
+// ── HippoRAG Light (Concept Graph) Functions ──────────────────────────────────
+
+function linkConcepts(conceptA, conceptB, weight = 1.0) {
+  if (!conceptA || !conceptB) return;
+  const a = String(conceptA).trim().toLowerCase();
+  const b = String(conceptB).trim().toLowerCase();
+  if (a === b || a.length < 2 || b.length < 2) return;
+
+  // Store in deterministic alphabetical order to avoid duplicate reverse links
+  const [first, second] = a < b ? [a, b] : [b, a];
+  try {
+    stmtLinkConcepts.run({
+      concept_a: first,
+      concept_b: second,
+      weight: parseFloat(weight) || 1.0
+    });
+  } catch (_) {}
+}
+
+function getAssociatedConcepts(concept, limit = 3) {
+  if (!concept) return [];
+  const c = String(concept).trim().toLowerCase();
+  try {
+    const rows = stmtGetNeighbors.all(c, c, limit);
+    return rows.map(r => r.concept);
+  } catch (_) {
+    return [];
+  }
+}
+
+function recordMemoryConcepts(tagsStr, contentStr) {
+  const concepts = new Set();
+
+  // Extract from tags
+  if (tagsStr) {
+    tagsStr.split(/[,\s]+/).forEach(t => {
+      const clean = t.replace(/^[#\s]+|[#\s]+$/g, '').trim().toLowerCase();
+      if (clean.length > 2) concepts.add(clean);
+    });
+  }
+
+  // Extract hashtags from content
+  const contentHashtags = (contentStr.match(/#([a-zA-Zа-яА-ЯёЁ_]{3,})/g) || []).map(h => h.slice(1).toLowerCase());
+  contentHashtags.forEach(h => concepts.add(h));
+
+  const conceptArr = Array.from(concepts);
+  if (conceptArr.length >= 2) {
+    for (let i = 0; i < conceptArr.length; i++) {
+      for (let j = i + 1; j < conceptArr.length; j++) {
+        linkConcepts(conceptArr[i], conceptArr[j], 1.0);
+      }
+    }
+  }
+}
+
 module.exports = {
   addShort,
   addLong,
@@ -447,5 +623,15 @@ module.exports = {
   getRandomLongMem,
   getCoreMemoryBlocks,
   getArchivalMemory,
-  getRecallMemory
+  getRecallMemory,
+  // Mem0 User Profile Layer
+  getUserProfile,
+  upsertUserProfile,
+  touchUserSeen,
+  getRecentUserProfiles,
+  // HippoRAG Light Concept Graph
+  linkConcepts,
+  getAssociatedConcepts,
+  recordMemoryConcepts
 };
+
